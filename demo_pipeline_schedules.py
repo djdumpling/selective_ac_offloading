@@ -63,7 +63,7 @@ def compare_schedules(name, cfg, gpu, par):
             "stash_last": profile.stash_counts[-1],
             "symmetric": profile.stash_counts[0] == profile.stash_counts[-1],
             "bubble": profile.bubble_fraction,
-            "extra_mem_gb": profile.extra_memory_per_stage / 1024**3,
+            "extra_mem_gb": max(profile.extra_memory_per_stage) / 1024**3,
             "uniform_full_fit": pr_uniform_full.all_fit,
             "uniform_full_step": pr_uniform_full.overall_step_latency_s,
             "uniform_full_ovhd": pr_uniform_full.total_recompute_overhead_pct,

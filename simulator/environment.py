@@ -472,6 +472,26 @@ def _build_fa_selective_decisions(
     return decisions
 
 
+def _build_korthikanti_selective_decisions(
+    tensors: list[TensorInfo],
+    cfg: ModelConfig,
+) -> dict[str, TensorDecision]:
+    """Korthikanti selective: recompute attention core (QK^T, softmax, dropout output).
+
+    Only effective without FlashAttention — eliminates the quadratic 5as²b term
+    at ~2.7% overhead.  With FA active, this degenerates to No AC (the quadratic
+    tensors don't exist).
+    """
+    recompute_names = {"attn_softmax", "attn_softmax_dropout_output"}
+    decisions = {}
+    for t in tensors:
+        if not cfg.use_flash_attention and t.name in recompute_names and t.recomputable:
+            decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+        else:
+            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+    return decisions
+
+
 def _build_full_ac_decisions(
     tensors: list[TensorInfo],
 ) -> dict[str, TensorDecision]:
@@ -485,10 +505,12 @@ def _build_full_ac_decisions(
     return decisions
 
 
-# Named strategy levels in order of increasing aggressiveness
+# Named strategy levels in order of increasing aggressiveness.
+# Pipeline-aware AC tries these in order and picks the first that fits.
 STRATEGY_LEVELS = [
     ("No AC", _build_no_ac_decisions),
     ("FA-Selective", _build_fa_selective_decisions),
+    ("Korthikanti Selective", _build_korthikanti_selective_decisions),
     ("Full AC", _build_full_ac_decisions),
 ]
 
@@ -508,12 +530,14 @@ class PipelineStageResult:
 class PipelineResult:
     """Aggregate result across all pipeline stages."""
     stages: list[PipelineStageResult]
-    bottleneck_stage: int           # Stage with highest step latency
-    overall_step_latency_s: float   # = max stage latency (pipeline-bound)
+    bottleneck_stage: int               # Stage with highest step latency
+    bottleneck_step_latency_s: float    # Per-microbatch time of slowest stage
+    overall_step_latency_s: float       # Bubble-adjusted effective per-microbatch latency
     total_recompute_overhead_pct: float  # Bottleneck stage's overhead
-    all_fit: bool                   # All stages fit in memory
+    all_fit: bool                       # All stages fit in memory
     schedule_name: str = ""
     bubble_fraction: float = 0.0
+    num_microbatches: int = 16
 
     @property
     def bottleneck(self) -> PipelineStageResult:
@@ -525,27 +549,37 @@ def _stash_count_1f1b(stage_idx: int, pp_size: int) -> int:
     return max(0, pp_size - 1 - stage_idx)
 
 
+def _build_decisions(build_fn, tensors, cfg):
+    """Call a strategy builder, handling the cfg argument for FA-Selective."""
+    if build_fn == _build_fa_selective_decisions:
+        return build_fn(tensors, cfg)
+    if build_fn == _build_korthikanti_selective_decisions:
+        return build_fn(tensors, cfg)
+    return build_fn(tensors)
+
+
 def _run_pipeline_simulation(
     cfg: ModelConfig,
     gpu: GPUConfig,
     par: ParallelismConfig,
     stash_counts: list[int],
     strategy_assignments: list[str],
-    extra_memory_per_stage: float = 0.0,
+    extra_memory_per_stage: list[float],
     efficiency: float = 0.5,
     memory_budget_frac: float = 0.90,
     schedule_name: str = "",
     bubble_fraction: float = 0.0,
+    num_microbatches: int = 16,
 ) -> PipelineResult:
     """Core pipeline simulation: run each stage with its assigned strategy.
 
     Args:
         stash_counts: Per-stage microbatch stash count.
         strategy_assignments: Per-stage strategy name from STRATEGY_LEVELS.
-        extra_memory_per_stage: Extra bytes per stage (e.g., deferred W in ZB-H2).
+        extra_memory_per_stage: Per-stage extra bytes (e.g., deferred W in ZB-H2).
+        bubble_fraction: Fraction of total step time wasted in pipeline bubble.
+        num_microbatches: Total microbatches per training step (affects bubble cost).
     """
-    from .pipeline_schedules import ScheduleProfile
-
     pp_size = par.pp_size
     tensors = get_all_tensors_per_layer(cfg, par)
 
@@ -560,10 +594,7 @@ def _run_pipeline_simulation(
         build_fn = strategy_lookup[sname]
 
         start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
-        if build_fn == _build_fa_selective_decisions:
-            decisions = build_fn(tensors, cfg)
-        else:
-            decisions = build_fn(tensors)
+        decisions = _build_decisions(build_fn, tensors, cfg)
 
         strategies = [
             LayerStrategy(layer_idx=i, decisions=decisions)
@@ -579,13 +610,14 @@ def _run_pipeline_simulation(
             num_microbatches_in_flight=stash_count,
         )
 
-        # Account for extra memory (e.g., ZB-H2 deferred gradients)
-        if extra_memory_per_stage > 0:
-            adjusted_peak = result.total_peak_memory_bytes + extra_memory_per_stage
+        # Account for per-stage extra memory (e.g., ZB-H2 deferred gradients)
+        stage_extra = extra_memory_per_stage[stage_idx]
+        if stage_extra > 0:
+            adjusted_peak = result.total_peak_memory_bytes + stage_extra
             result = SimulatorResult(
                 param_memory_bytes=result.param_memory_bytes,
                 optimizer_memory_bytes=result.optimizer_memory_bytes,
-                gradient_memory_bytes=result.gradient_memory_bytes + extra_memory_per_stage,
+                gradient_memory_bytes=result.gradient_memory_bytes + stage_extra,
                 peak_activation_memory_bytes=result.peak_activation_memory_bytes,
                 total_peak_memory_bytes=adjusted_peak,
                 hbm_capacity_bytes=result.hbm_capacity_bytes,
@@ -611,17 +643,25 @@ def _run_pipeline_simulation(
         ))
 
     bottleneck_idx = max(range(pp_size), key=lambda i: stage_results[i].sim.step_latency_s)
-    overall_latency = stage_results[bottleneck_idx].sim.step_latency_s
+    bottleneck_latency = stage_results[bottleneck_idx].sim.step_latency_s
     all_fit = all(sr.sim.fits_in_memory for sr in stage_results)
+
+    # Bubble-adjusted effective per-microbatch latency.
+    # For M microbatches, total pipeline time is:
+    #   M × bottleneck_per_microbatch × (1 + bubble_fraction)
+    # Dividing by M gives the effective per-microbatch latency reported here.
+    overall_latency = bottleneck_latency * (1.0 + bubble_fraction)
 
     return PipelineResult(
         stages=stage_results,
         bottleneck_stage=bottleneck_idx,
+        bottleneck_step_latency_s=bottleneck_latency,
         overall_step_latency_s=overall_latency,
         total_recompute_overhead_pct=stage_results[bottleneck_idx].sim.recompute_overhead_pct,
         all_fit=all_fit,
         schedule_name=schedule_name,
         bubble_fraction=bubble_fraction,
+        num_microbatches=num_microbatches,
     )
 
 
@@ -659,14 +699,12 @@ def simulate_pipeline_aware_ac(
     strategy_assignments: list[str] = []
     for stage_idx in range(pp_size):
         stash_count = profile.stash_counts[stage_idx]
+        stage_extra = profile.extra_memory_per_stage[stage_idx]
         chosen = None
 
         for level_name, build_fn in STRATEGY_LEVELS:
             start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
-            if build_fn == _build_fa_selective_decisions:
-                decisions = build_fn(tensors, cfg)
-            else:
-                decisions = build_fn(tensors)
+            decisions = _build_decisions(build_fn, tensors, cfg)
 
             strategies = [
                 LayerStrategy(layer_idx=i, decisions=decisions)
@@ -682,8 +720,8 @@ def simulate_pipeline_aware_ac(
                 num_microbatches_in_flight=stash_count,
             )
 
-            # Check fit including extra memory
-            peak_with_extra = result.total_peak_memory_bytes + profile.extra_memory_per_stage
+            # Check fit including per-stage extra memory
+            peak_with_extra = result.total_peak_memory_bytes + stage_extra
             if peak_with_extra <= result.hbm_capacity_bytes:
                 chosen = level_name
                 break
@@ -699,6 +737,7 @@ def simulate_pipeline_aware_ac(
         memory_budget_frac=memory_budget_frac,
         schedule_name=profile.description,
         bubble_fraction=profile.bubble_fraction,
+        num_microbatches=num_microbatches,
     )
 
 
@@ -734,6 +773,7 @@ def simulate_pipeline_uniform_ac(
         memory_budget_frac=memory_budget_frac,
         schedule_name=profile.description,
         bubble_fraction=profile.bubble_fraction,
+        num_microbatches=num_microbatches,
     )
 
 
@@ -757,10 +797,15 @@ def print_pipeline_result(pr: PipelineResult) -> None:
             f"{sr.sim.recompute_overhead_pct:>6.2f}% {fit:>4}{marker}"
         )
 
-    bubble_str = f", bubble={pr.bubble_fraction:.1%}" if pr.bubble_fraction > 0 else ""
-    print(f"\n  Overall: step={pr.overall_step_latency_s*1000:.2f}ms, "
-          f"overhead={pr.total_recompute_overhead_pct:.2f}%, "
-          f"all_fit={'YES' if pr.all_fit else 'NO'}{bubble_str}")
+    if pr.bubble_fraction > 0:
+        print(f"\n  Bottleneck per-microbatch: {pr.bottleneck_step_latency_s*1000:.2f}ms")
+        print(f"  Bubble overhead: +{pr.bubble_fraction:.1%}")
+        print(f"  Effective per-microbatch: {pr.overall_step_latency_s*1000:.2f}ms "
+              f"(= {pr.bottleneck_step_latency_s*1000:.2f} × {1+pr.bubble_fraction:.3f})")
+    else:
+        print(f"\n  Per-microbatch: {pr.overall_step_latency_s*1000:.2f}ms (zero bubble)")
+    print(f"  Overhead: {pr.total_recompute_overhead_pct:.2f}%, "
+          f"all_fit={'YES' if pr.all_fit else 'NO'}")
 
 
 # ── Single-stage convenience strategies ──────────────────────────────────────

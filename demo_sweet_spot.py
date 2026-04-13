@@ -88,8 +88,12 @@ def search_sweet_spot(name, model_fn, gpu, pp_values, dp, seq_lens, mbs_values):
                     pr_uniform_full.overall_step_latency_s / pr_aware.overall_step_latency_s - 1
                 ) * 100 if pr_aware.overall_step_latency_s > 0 else 0
 
-                # Only show interesting cases
-                if bottleneck_strategy != "Full AC" and len(set(aware_strategies)) >= 1:
+                # Only show genuinely differentiated cases:
+                # - Multiple strategies used across stages (not trivially uniform)
+                # - Bottleneck avoids Full AC (the actual throughput win)
+                is_differentiated = len(set(aware_strategies)) >= 2
+                bottleneck_avoids_full = bottleneck_strategy != "Full AC"
+                if is_differentiated and bottleneck_avoids_full:
                     found_any = True
                     print(f"\n  CONFIG: pp={pp}, seq={seq}, mbs={mbs}, dp={dp}")
                     print(f"  Uniform Full AC: step={pr_uniform_full.overall_step_latency_s*1000:.1f}ms, "

@@ -40,7 +40,7 @@ class ScheduleProfile:
     num_chunks: int                  # Virtual stages per device (1 for non-interleaved)
     stash_counts: list[int]          # Per-stage stash count
     bubble_fraction: float           # Fraction of step time wasted in bubble
-    extra_memory_per_stage: float    # Extra bytes per stage (e.g., deferred W)
+    extra_memory_per_stage: list[float]  # Extra bytes per stage (e.g., deferred W)
     description: str
 
 
@@ -142,30 +142,27 @@ def _bubble_zero() -> float:
 def _extra_memory_zb_h2(
     cfg: ModelConfig,
     par: ParallelismConfig,
-) -> float:
-    """ZB-H2 extra memory: deferred weight gradients.
+) -> list[float]:
+    """ZB-H2 extra memory: deferred weight gradients, computed per stage.
 
     ZB-H2 defers up to PP weight gradient computations to fill the bubble.
-    Each deferred W stores one layer's weight gradient in the same dtype
-    as the model weights (bf16).  With PP deferred W's per stage:
+    Each deferred W stores one full set of weight gradients for the stage's
+    local layers.  Stages with fewer layers (uneven division) have less
+    deferred-W overhead.
 
-    extra = PP × (local_layer_params × bytes_per_param)
-
-    For Llama-7B (PP=4, 8 layers/stage, ~200M params/layer):
-    extra = 4 × 200M × 2 ≈ 1.6 GB per stage
+    extra_stage_i = PP × (local_layers_i × params_per_layer × bytes_per_param / tp)
     """
     from .environment import _layer_param_count, _stage_layer_span
 
     pp = par.pp_size
-    # Each stage defers up to PP weight gradient updates
-    # Each deferred W is one full set of weight gradients for local layers
-    start, end = _stage_layer_span(cfg.num_layers, pp, 0)
-    local_layers = end - start
-    params_per_stage = local_layers * _layer_param_count(cfg)
-    gradient_bytes = params_per_stage * cfg.dtype_bytes / par.tp_size
-
-    # PP deferred W's worth of gradients
-    return pp * gradient_bytes
+    extras = []
+    for stage_idx in range(pp):
+        start, end = _stage_layer_span(cfg.num_layers, pp, stage_idx)
+        local_layers = end - start
+        params_per_stage = local_layers * _layer_param_count(cfg)
+        gradient_bytes = params_per_stage * cfg.dtype_bytes / par.tp_size
+        extras.append(pp * gradient_bytes)
+    return extras
 
 
 # ── Main interface ───────────────────────────────────────────────────────────
@@ -188,43 +185,45 @@ def get_schedule_profile(
     """
     pp = par.pp_size
 
+    zero_extras = [0.0] * pp
+
     if schedule == PipelineSchedule.ONE_F_ONE_B:
         stash_counts = [_stash_1f1b(s, pp) for s in range(pp)]
         bubble = _bubble_1f1b(pp, num_microbatches)
-        extra = 0.0
+        extras = zero_extras
         desc = f"1F1B: asymmetric stash (first={pp-1}, last=0), bubble={bubble:.1%}"
 
     elif schedule == PipelineSchedule.ONE_F_ONE_B_INTERLEAVED:
         stash_counts = [_stash_1f1b_interleaved(s, pp) for s in range(pp)]
         bubble = _bubble_1f1b_interleaved(pp, num_microbatches, num_chunks)
-        extra = 0.0
+        extras = zero_extras
         desc = (f"1F1B Interleaved (v={num_chunks}): "
                 f"same stash as 1F1B, bubble={bubble:.1%}")
 
     elif schedule == PipelineSchedule.ZB_H1:
         stash_counts = [_stash_zb_h1(s, pp) for s in range(pp)]
         bubble = _bubble_zero()
-        extra = 0.0
+        extras = zero_extras
         desc = f"ZB-H1: same stash as 1F1B, near-zero bubble, 1 deferred W"
 
     elif schedule == PipelineSchedule.ZB_H2:
         stash_counts = [_stash_zb_h2(s, pp) for s in range(pp)]
         bubble = _bubble_zero()
-        extra = _extra_memory_zb_h2(cfg, par)
+        extras = _extra_memory_zb_h2(cfg, par)
         desc = (f"ZB-H2: same stash as 1F1B, zero bubble, "
-                f"PP deferred W (+{extra / 1024**3:.2f} GB/stage)")
+                f"PP deferred W (+{max(extras) / 1024**3:.2f} GB/stage max)")
 
     elif schedule == PipelineSchedule.ZB_V:
         stash_counts = [_stash_zb_v(s, pp, num_chunks) for s in range(pp)]
         bubble = _bubble_zero()
-        extra = 0.0
+        extras = zero_extras
         desc = (f"ZB-V (v={num_chunks}): "
                 f"same stash as 1F1B, zero bubble with virtual stages")
 
     elif schedule == PipelineSchedule.DUALPIPE:
         stash_counts = [_stash_dualpipe(s, pp) for s in range(pp)]
         bubble = _bubble_zero()
-        extra = 0.0
+        extras = zero_extras
         desc = (f"DualPipe: SYMMETRIC stash (all stages={pp-1}), "
                 f"zero bubble, bidirectional")
 
@@ -237,6 +236,6 @@ def get_schedule_profile(
         num_chunks=num_chunks,
         stash_counts=stash_counts,
         bubble_fraction=bubble,
-        extra_memory_per_stage=extra,
+        extra_memory_per_stage=extras,
         description=desc,
     )

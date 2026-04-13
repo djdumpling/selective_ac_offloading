@@ -211,6 +211,94 @@ it as a general technique and show results across schedules, noting that DualPip
 symmetric design eliminates the opportunity while ZB-H2's deferred-W overhead creates
 new opportunities.
 
+## 8. Bug Fixes and Corrected Results
+
+Four bugs were identified (via adversarial review) and fixed. The corrections changed
+some numerical results but **strengthened rather than weakened** the core claims.
+
+### Fix 1: Bubble fraction now affects pipeline throughput (High severity)
+
+**Bug:** `bubble_fraction` was computed per schedule but never used — overall latency was
+always `max(stage_latency)` regardless of schedule. All schedules showed identical step
+times.
+
+**Fix:** Overall latency = `bottleneck_per_microbatch × (1 + bubble_fraction)`.
+
+**Impact on results:**
+
+| Config (Llama-7B PP=4) | Before Fix | After Fix |
+|-------------------------|------------|-----------|
+| 1F1B step time | 1481.9 ms | **1759.8 ms** (+18.8% bubble) |
+| 1F1B Interleaved step time | 1481.9 ms | **1620.9 ms** (+9.4% bubble) |
+| ZB-H1 step time | 1481.9 ms | **1481.9 ms** (zero bubble, unchanged) |
+
+| Config (GPT-3 175B PP=8) | Before Fix | After Fix |
+|---------------------------|------------|-----------|
+| 1F1B step time | 264.7 ms | **380.5 ms** (+43.8% bubble!) |
+| ZB-H1 step time | 264.7 ms | **264.7 ms** (unchanged) |
+
+**Implication for paper:** This fix makes the schedule comparison meaningful. The 1F1B → ZB
+throughput improvement (44% for GPT-3 PP=8) was invisible before. It also changes the
+pipeline-aware throughput gain calculation — when comparing pipeline-aware under 1F1B vs.
+uniform Full AC under 1F1B, both include the same bubble overhead, so the relative gain
+from AC strategy is unchanged. But comparing pipeline-aware across schedules now correctly
+shows ZB's advantage.
+
+### Fix 2: Korthikanti selective added to pipeline strategy search (High severity)
+
+**Bug:** `STRATEGY_LEVELS` only had No AC, FA-Selective, and Full AC. For non-FA models
+(GPT-3 175B), FA-Selective only recomputes `mlp_linear2_input` which doesn't address the
+quadratic attention term. The pipeline-aware search jumped directly from "doesn't fit" to
+Full AC (20%+ overhead), skipping Korthikanti selective (~2.7% overhead).
+
+**Fix:** Added "Korthikanti Selective" between FA-Selective and Full AC. It recomputes
+the attention core (QK^T, softmax, dropout output) — only effective without FA.
+
+**Impact:** For non-FA models under memory pressure, pipeline-aware can now assign
+Korthikanti Selective (~2.7% overhead) instead of Full AC (~20% overhead). This is a
+large throughput improvement for pre-FA architectures.
+
+### Fix 3: Sweet-spot search filter corrected (Medium severity)
+
+**Bug:** Filter `len(set(strategies)) >= 1` is always true. Dozens of trivial "all No AC"
+cases were reported as "breakthroughs" with +23% gains.
+
+**Fix:** Require `len(set(strategies)) >= 2` (genuinely differentiated) AND bottleneck
+avoids Full AC.
+
+**Impact:** Search now correctly reports only 3 genuine sweet-spot cases (Llama-7B PP=8
+with FA-Selective on stage 0, No AC on stages 1-7). The +24.6% gain in these cases was
+always real — the fix just removed the noise around it.
+
+### Fix 4: ZB-H2 per-stage extra memory (Medium severity)
+
+**Bug:** ZB-H2 deferred-W memory was computed from stage 0's layer count and applied
+uniformly. Stages with fewer layers (uneven PP division) were overcharged.
+
+**Fix:** Compute per-stage from each stage's actual layer count.
+
+**Impact:** Small — only affects uneven PP divisions (e.g., 32 layers / 3 stages). The
+last stage now correctly gets less deferred-W overhead.
+
+### Do the core claims still hold?
+
+**Yes.** Summary of impact on each claim:
+
+| Claim | Effect of Fixes |
+|-------|-----------------|
+| Korthikanti selective = no-op with FA | Unchanged — this is a structural property, not a numerical result |
+| FA-Selective saves 12-18% at ~0% overhead | Unchanged — single-stage result, not affected by pipeline fixes |
+| Pipeline-aware +24.6% in sweet spot | **Unchanged** — the per-microbatch bottleneck is the same; bubble affects absolute time but not relative gain |
+| Multi-schedule comparison | **Corrected** — now shows meaningful differences between 1F1B (43.8% bubble for PP=8) and ZB (zero bubble) |
+| 3-Resource costs 1.6-3.2% | Unchanged — single-stage result |
+| DualPipe nullifies pipeline-aware | Unchanged — structural property |
+| Non-FA pipeline-aware | **Improved** — Korthikanti selective now available, reducing bottleneck overhead from ~20% to ~2.7% |
+
+The fixes made the simulator more accurate without invalidating any core contribution.
+The main numerical change is that 1F1B step times are now 19-44% higher (due to bubble),
+which makes the ZB schedule comparison genuine and strengthens the argument for considering
+pipeline schedules jointly with AC strategy.
+
 ---
 
 ## Paper Formulation
@@ -252,7 +340,7 @@ non-uniform checkpointing.
    amplified by ZB-H2's deferred-W overhead, and nullified by DualPipe's symmetric stash.
 
 5. **(System)** Analytical simulator with per-tensor granularity, realistic compression
-   compute cost, PCIe contention modeling, and multi-schedule pipeline support. 60 tests
+   compute cost, PCIe contention modeling, and multi-schedule pipeline support. 63 tests
    validated against Korthikanti formulas.
 
 ### Optional Extension (if time permits)
@@ -313,13 +401,15 @@ pipeline-aware AC interacts with each.
 4. **Multi-schedule validation.** If possible, test with ZB-H1/H2 (available in the
    zero-bubble codebase) to confirm the schedule-interaction predictions.
 
-### Current state of evidence
+### Current state of evidence (post bug-fix)
 
-| Claim | Status | Evidence |
-|-------|--------|----------|
-| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 60 tests |
-| FA-Selective saves 12-18% at ~0% overhead | Analytical ✓ | Needs GPU validation |
-| Pipeline-aware gives +24.6% in sweet spot | Analytical ✓ | Needs GPU validation |
-| 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation |
-| DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument |
-| ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation |
+| Claim | Status | Evidence | Survived Bug Fixes? |
+|-------|--------|----------|---------------------|
+| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 63 tests | Yes (structural) |
+| FA-Selective saves 12-18% at ~0% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
+| Pipeline-aware gives +24.6% in sweet spot | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
+| 1F1B has 19-44% bubble overhead vs ZB | Analytical ✓ | Post-fix comparison | NEW (was broken) |
+| Non-FA pipeline uses Korthikanti (~2.7%) | Analytical ✓ | Post-fix strategy search | NEW (was skipped) |
+| 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
+| DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument | Yes (structural) |
+| ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
