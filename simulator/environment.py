@@ -449,6 +449,322 @@ def simulate_selective_ac(
     return simulate(cfg, gpu, strategies=strategies, par=par, **kwargs)
 
 
+# ── Strategy builders for pipeline-aware AC ──────────────────────────────────
+
+def _build_no_ac_decisions(
+    tensors: list[TensorInfo],
+) -> dict[str, TensorDecision]:
+    """All tensors kept — maximum memory, zero overhead."""
+    return {t.name: TensorDecision(action=TensorAction.KEEP) for t in tensors}
+
+
+def _build_fa_selective_decisions(
+    tensors: list[TensorInfo],
+    cfg: ModelConfig,
+) -> dict[str, TensorDecision]:
+    """FA-era selective: recompute mlp_linear2_input only."""
+    decisions = {}
+    for t in tensors:
+        if t.name == "mlp_linear2_input":
+            decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+        else:
+            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+    return decisions
+
+
+def _build_full_ac_decisions(
+    tensors: list[TensorInfo],
+) -> dict[str, TensorDecision]:
+    """Full recomputation — minimum memory, maximum overhead."""
+    decisions = {}
+    for t in tensors:
+        if not t.recomputable:
+            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+        else:
+            decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+    return decisions
+
+
+# Named strategy levels in order of increasing aggressiveness
+STRATEGY_LEVELS = [
+    ("No AC", _build_no_ac_decisions),
+    ("FA-Selective", _build_fa_selective_decisions),
+    ("Full AC", _build_full_ac_decisions),
+]
+
+
+# ── Pipeline-aware multi-stage simulation ────────────────────────────────────
+
+@dataclass
+class PipelineStageResult:
+    """Result for one pipeline stage."""
+    stage_idx: int
+    strategy_name: str
+    num_stashed_microbatches: int
+    sim: SimulatorResult
+
+
+@dataclass
+class PipelineResult:
+    """Aggregate result across all pipeline stages."""
+    stages: list[PipelineStageResult]
+    bottleneck_stage: int           # Stage with highest step latency
+    overall_step_latency_s: float   # = max stage latency (pipeline-bound)
+    total_recompute_overhead_pct: float  # Bottleneck stage's overhead
+    all_fit: bool                   # All stages fit in memory
+    schedule_name: str = ""
+    bubble_fraction: float = 0.0
+
+    @property
+    def bottleneck(self) -> PipelineStageResult:
+        return self.stages[self.bottleneck_stage]
+
+
+def _stash_count_1f1b(stage_idx: int, pp_size: int) -> int:
+    """Number of in-flight microbatch activations stashed at a 1F1B stage."""
+    return max(0, pp_size - 1 - stage_idx)
+
+
+def _run_pipeline_simulation(
+    cfg: ModelConfig,
+    gpu: GPUConfig,
+    par: ParallelismConfig,
+    stash_counts: list[int],
+    strategy_assignments: list[str],
+    extra_memory_per_stage: float = 0.0,
+    efficiency: float = 0.5,
+    memory_budget_frac: float = 0.90,
+    schedule_name: str = "",
+    bubble_fraction: float = 0.0,
+) -> PipelineResult:
+    """Core pipeline simulation: run each stage with its assigned strategy.
+
+    Args:
+        stash_counts: Per-stage microbatch stash count.
+        strategy_assignments: Per-stage strategy name from STRATEGY_LEVELS.
+        extra_memory_per_stage: Extra bytes per stage (e.g., deferred W in ZB-H2).
+    """
+    from .pipeline_schedules import ScheduleProfile
+
+    pp_size = par.pp_size
+    tensors = get_all_tensors_per_layer(cfg, par)
+
+    # Build strategy lookup
+    strategy_lookup = {name: fn for name, fn in STRATEGY_LEVELS}
+
+    stage_results: list[PipelineStageResult] = []
+
+    for stage_idx in range(pp_size):
+        stash_count = stash_counts[stage_idx]
+        sname = strategy_assignments[stage_idx]
+        build_fn = strategy_lookup[sname]
+
+        start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
+        if build_fn == _build_fa_selective_decisions:
+            decisions = build_fn(tensors, cfg)
+        else:
+            decisions = build_fn(tensors)
+
+        strategies = [
+            LayerStrategy(layer_idx=i, decisions=decisions)
+            for i in range(start, end)
+        ]
+
+        result = simulate(
+            cfg, gpu, strategies,
+            par=par,
+            efficiency=efficiency,
+            memory_budget_frac=memory_budget_frac,
+            pipeline_stage=stage_idx,
+            num_microbatches_in_flight=stash_count,
+        )
+
+        # Account for extra memory (e.g., ZB-H2 deferred gradients)
+        if extra_memory_per_stage > 0:
+            adjusted_peak = result.total_peak_memory_bytes + extra_memory_per_stage
+            result = SimulatorResult(
+                param_memory_bytes=result.param_memory_bytes,
+                optimizer_memory_bytes=result.optimizer_memory_bytes,
+                gradient_memory_bytes=result.gradient_memory_bytes + extra_memory_per_stage,
+                peak_activation_memory_bytes=result.peak_activation_memory_bytes,
+                total_peak_memory_bytes=adjusted_peak,
+                hbm_capacity_bytes=result.hbm_capacity_bytes,
+                fits_in_memory=adjusted_peak <= result.hbm_capacity_bytes,
+                total_recompute_flops=result.total_recompute_flops,
+                recompute_overhead_pct=result.recompute_overhead_pct,
+                total_offload_stall_s=result.total_offload_stall_s,
+                total_compression_flops=result.total_compression_flops,
+                total_compression_error=result.total_compression_error,
+                per_layer=result.per_layer,
+                fwd_latency_s=result.fwd_latency_s,
+                bwd_latency_s=result.bwd_latency_s,
+                step_latency_s=result.step_latency_s,
+                pipeline_stage=result.pipeline_stage,
+                stashed_microbatch_bytes=result.stashed_microbatch_bytes,
+            )
+
+        stage_results.append(PipelineStageResult(
+            stage_idx=stage_idx,
+            strategy_name=sname,
+            num_stashed_microbatches=stash_count,
+            sim=result,
+        ))
+
+    bottleneck_idx = max(range(pp_size), key=lambda i: stage_results[i].sim.step_latency_s)
+    overall_latency = stage_results[bottleneck_idx].sim.step_latency_s
+    all_fit = all(sr.sim.fits_in_memory for sr in stage_results)
+
+    return PipelineResult(
+        stages=stage_results,
+        bottleneck_stage=bottleneck_idx,
+        overall_step_latency_s=overall_latency,
+        total_recompute_overhead_pct=stage_results[bottleneck_idx].sim.recompute_overhead_pct,
+        all_fit=all_fit,
+        schedule_name=schedule_name,
+        bubble_fraction=bubble_fraction,
+    )
+
+
+def simulate_pipeline_aware_ac(
+    cfg: ModelConfig,
+    gpu: GPUConfig,
+    par: ParallelismConfig,
+    schedule=None,
+    efficiency: float = 0.5,
+    memory_budget_frac: float = 0.90,
+    num_microbatches: int = 16,
+    num_chunks: int = 2,
+) -> PipelineResult:
+    """Simulate non-uniform AC across pipeline stages under any schedule.
+
+    For each stage, selects the **least aggressive** AC strategy that
+    fits within the HBM budget after accounting for the schedule-specific
+    stashed microbatch activations.
+
+    Args:
+        schedule: A PipelineSchedule enum value, or None for 1F1B default.
+    """
+    from .pipeline_schedules import PipelineSchedule, get_schedule_profile
+
+    if schedule is None:
+        schedule = PipelineSchedule.ONE_F_ONE_B
+
+    pp_size = par.pp_size
+    assert pp_size >= 2, "Pipeline-aware AC requires pp_size >= 2"
+
+    profile = get_schedule_profile(schedule, cfg, par, num_microbatches, num_chunks)
+    tensors = get_all_tensors_per_layer(cfg, par)
+
+    # For each stage, find the least aggressive strategy that fits
+    strategy_assignments: list[str] = []
+    for stage_idx in range(pp_size):
+        stash_count = profile.stash_counts[stage_idx]
+        chosen = None
+
+        for level_name, build_fn in STRATEGY_LEVELS:
+            start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
+            if build_fn == _build_fa_selective_decisions:
+                decisions = build_fn(tensors, cfg)
+            else:
+                decisions = build_fn(tensors)
+
+            strategies = [
+                LayerStrategy(layer_idx=i, decisions=decisions)
+                for i in range(start, end)
+            ]
+
+            result = simulate(
+                cfg, gpu, strategies,
+                par=par,
+                efficiency=efficiency,
+                memory_budget_frac=memory_budget_frac,
+                pipeline_stage=stage_idx,
+                num_microbatches_in_flight=stash_count,
+            )
+
+            # Check fit including extra memory
+            peak_with_extra = result.total_peak_memory_bytes + profile.extra_memory_per_stage
+            if peak_with_extra <= result.hbm_capacity_bytes:
+                chosen = level_name
+                break
+
+        strategy_assignments.append(chosen or "Full AC")
+
+    return _run_pipeline_simulation(
+        cfg, gpu, par,
+        stash_counts=profile.stash_counts,
+        strategy_assignments=strategy_assignments,
+        extra_memory_per_stage=profile.extra_memory_per_stage,
+        efficiency=efficiency,
+        memory_budget_frac=memory_budget_frac,
+        schedule_name=profile.description,
+        bubble_fraction=profile.bubble_fraction,
+    )
+
+
+def simulate_pipeline_uniform_ac(
+    cfg: ModelConfig,
+    gpu: GPUConfig,
+    par: ParallelismConfig,
+    strategy_name: str = "Full AC",
+    schedule=None,
+    efficiency: float = 0.5,
+    memory_budget_frac: float = 0.90,
+    num_microbatches: int = 16,
+    num_chunks: int = 2,
+) -> PipelineResult:
+    """Simulate uniform AC across all pipeline stages under any schedule."""
+    from .pipeline_schedules import PipelineSchedule, get_schedule_profile
+
+    if schedule is None:
+        schedule = PipelineSchedule.ONE_F_ONE_B
+
+    pp_size = par.pp_size
+    assert pp_size >= 2, "Pipeline AC requires pp_size >= 2"
+
+    profile = get_schedule_profile(schedule, cfg, par, num_microbatches, num_chunks)
+    assignments = [strategy_name] * pp_size
+
+    return _run_pipeline_simulation(
+        cfg, gpu, par,
+        stash_counts=profile.stash_counts,
+        strategy_assignments=assignments,
+        extra_memory_per_stage=profile.extra_memory_per_stage,
+        efficiency=efficiency,
+        memory_budget_frac=memory_budget_frac,
+        schedule_name=profile.description,
+        bubble_fraction=profile.bubble_fraction,
+    )
+
+
+def print_pipeline_result(pr: PipelineResult) -> None:
+    """Pretty-print a pipeline-aware simulation result."""
+    if pr.schedule_name:
+        print(f"  Schedule: {pr.schedule_name}")
+
+    print(f"\n  {'Stage':>5} {'Strategy':<16} {'Stash':>5} "
+          f"{'Activation':>12} {'Peak':>12} {'Step(ms)':>10} {'Ovhd%':>7} {'Fit':>4}")
+    print(f"  {'-'*5} {'-'*16} {'-'*5} {'-'*12} {'-'*12} {'-'*10} {'-'*7} {'-'*4}")
+
+    for sr in pr.stages:
+        fit = "YES" if sr.sim.fits_in_memory else "NO"
+        marker = " <-- bottleneck" if sr.stage_idx == pr.bottleneck_stage else ""
+        print(
+            f"  {sr.stage_idx:>5} {sr.strategy_name:<16} {sr.num_stashed_microbatches:>5} "
+            f"{_fmt_bytes(sr.sim.peak_activation_memory_bytes):>12} "
+            f"{_fmt_bytes(sr.sim.total_peak_memory_bytes):>12} "
+            f"{sr.sim.step_latency_s * 1000:>10.2f} "
+            f"{sr.sim.recompute_overhead_pct:>6.2f}% {fit:>4}{marker}"
+        )
+
+    bubble_str = f", bubble={pr.bubble_fraction:.1%}" if pr.bubble_fraction > 0 else ""
+    print(f"\n  Overall: step={pr.overall_step_latency_s*1000:.2f}ms, "
+          f"overhead={pr.total_recompute_overhead_pct:.2f}%, "
+          f"all_fit={'YES' if pr.all_fit else 'NO'}{bubble_str}")
+
+
+# ── Single-stage convenience strategies ──────────────────────────────────────
+
 def simulate_fa_selective_ac(
     cfg: ModelConfig,
     gpu: GPUConfig,

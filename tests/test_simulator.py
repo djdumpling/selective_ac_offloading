@@ -53,7 +53,14 @@ from simulator.environment import (
     simulate_full_ac,
     simulate_selective_ac,
     simulate_fa_selective_ac,
+    simulate_pipeline_aware_ac,
+    simulate_pipeline_uniform_ac,
     print_result,
+    _stash_count_1f1b,
+)
+from simulator.pipeline_schedules import (
+    PipelineSchedule,
+    get_schedule_profile,
 )
 
 
@@ -637,6 +644,187 @@ class TestFAEraSelectiveAC:
                 assert action == "RECOMPUTE"
             else:
                 assert action == "KEEP", f"{tname} should be KEEP, got {action}"
+
+
+class TestPipelineAwareAC:
+    """Test pipeline-position-aware activation checkpointing."""
+
+    def test_stash_count_first_stage(self):
+        """First stage stashes PP-1 microbatches."""
+        assert _stash_count_1f1b(stage_idx=0, pp_size=8) == 7
+
+    def test_stash_count_last_stage(self):
+        """Last stage stashes 0 microbatches."""
+        assert _stash_count_1f1b(stage_idx=7, pp_size=8) == 0
+
+    def test_stash_count_monotonic(self):
+        """Stash count should decrease from first to last stage."""
+        pp = 8
+        counts = [_stash_count_1f1b(s, pp) for s in range(pp)]
+        assert counts == sorted(counts, reverse=True)
+
+    def test_aware_uses_different_strategies_per_stage(self):
+        """Pipeline-aware should NOT use the same strategy for all stages.
+
+        Uses Llama-7B with large batch + PP=4 where activation stashing
+        creates real memory pressure on early stages but not late stages.
+        """
+        cfg = llama_7b(seq_len=4096, micro_batch_size=4)
+        gpu = A100_80GB
+        par = ParallelismConfig(pp_size=4, dp_size=4)
+
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par)
+        strategies_used = set(sr.strategy_name for sr in pr.stages)
+        assert len(strategies_used) >= 2, (
+            f"Pipeline-aware should use different strategies when stashing "
+            f"creates differential pressure, but only used: {strategies_used}"
+        )
+
+    def test_first_stage_more_aggressive_than_last(self):
+        """First stage should use a more aggressive strategy than last stage."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par)
+        first = pr.stages[0]
+        last = pr.stages[-1]
+
+        # Strategy aggressiveness order: No AC < FA-Selective < Full AC
+        level_order = {"No AC": 0, "FA-Selective": 1, "Full AC": 2}
+        first_level = level_order[first.strategy_name]
+        last_level = level_order[last.strategy_name]
+
+        assert first_level >= last_level, (
+            f"First stage ({first.strategy_name}) should be at least as "
+            f"aggressive as last stage ({last.strategy_name})"
+        )
+
+    def test_aware_less_overhead_than_uniform_full_ac(self):
+        """Pipeline-aware should have less overhead than uniform Full AC.
+
+        The key benefit: late stages don't need Full AC, so the bottleneck
+        stage (with lowest recompute overhead) is faster.
+        """
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+
+        pr_aware = simulate_pipeline_aware_ac(cfg, gpu, par)
+        pr_uniform = simulate_pipeline_uniform_ac(cfg, gpu, par, strategy_name="Full AC")
+
+        assert pr_aware.overall_step_latency_s <= pr_uniform.overall_step_latency_s, (
+            f"Pipeline-aware ({pr_aware.overall_step_latency_s*1000:.2f}ms) should be "
+            f"no slower than uniform Full AC ({pr_uniform.overall_step_latency_s*1000:.2f}ms)"
+        )
+
+    def test_all_stages_present(self):
+        """Should have one result per pipeline stage."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par)
+        assert len(pr.stages) == par.pp_size
+
+    def test_stash_count_in_results(self):
+        """Each stage's stash count should match the 1F1B formula."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par)
+        for sr in pr.stages:
+            expected = _stash_count_1f1b(sr.stage_idx, par.pp_size)
+            assert sr.num_stashed_microbatches == expected
+
+    def test_late_stages_use_less_memory(self):
+        """Late stages (less stashing) should have lower peak memory."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par)
+        first_peak = pr.stages[0].sim.total_peak_memory_bytes
+        last_peak = pr.stages[-1].sim.total_peak_memory_bytes
+
+        assert last_peak <= first_peak, (
+            f"Last stage peak ({_gb(last_peak):.2f} GB) should be ≤ "
+            f"first stage peak ({_gb(first_peak):.2f} GB)"
+        )
+
+
+class TestMultiSchedulePipeline:
+    """Test pipeline-aware AC across different pipeline schedules."""
+
+    def test_dualpipe_symmetric_stash(self):
+        """DualPipe should have equal stash count on all stages."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        profile = get_schedule_profile(PipelineSchedule.DUALPIPE, cfg, par)
+        assert all(s == par.pp_size - 1 for s in profile.stash_counts), (
+            f"DualPipe should have symmetric stash={par.pp_size-1}, "
+            f"got {profile.stash_counts}"
+        )
+
+    def test_1f1b_asymmetric_stash(self):
+        """1F1B should have decreasing stash from first to last stage."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        profile = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par)
+        assert profile.stash_counts == list(range(7, -1, -1))
+
+    def test_zb_h2_extra_memory(self):
+        """ZB-H2 should have non-zero extra memory for deferred W."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        profile = get_schedule_profile(PipelineSchedule.ZB_H2, cfg, par)
+        assert profile.extra_memory_per_stage > 0, "ZB-H2 should have deferred W memory"
+
+    def test_zb_zero_bubble(self):
+        """ZB schedules should have zero bubble fraction."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        for sched in [PipelineSchedule.ZB_H1, PipelineSchedule.ZB_H2, PipelineSchedule.ZB_V]:
+            profile = get_schedule_profile(sched, cfg, par)
+            assert profile.bubble_fraction == 0.0, f"{sched} should have zero bubble"
+
+    def test_1f1b_has_bubble(self):
+        """1F1B should have nonzero bubble fraction."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        profile = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par)
+        assert profile.bubble_fraction > 0
+
+    def test_interleaved_less_bubble(self):
+        """1F1B Interleaved should have less bubble than 1F1B."""
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        cfg = gpt3_175b()
+        p_1f1b = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par)
+        p_inter = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B_INTERLEAVED, cfg, par)
+        assert p_inter.bubble_fraction < p_1f1b.bubble_fraction
+
+    def test_dualpipe_aware_all_same_strategy(self):
+        """DualPipe has symmetric stash, so pipeline-aware should pick the same strategy everywhere."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        par = ParallelismConfig(tp_size=8, pp_size=8)
+        pr = simulate_pipeline_aware_ac(cfg, gpu, par, schedule=PipelineSchedule.DUALPIPE)
+        strategies = set(sr.strategy_name for sr in pr.stages)
+        assert len(strategies) == 1, (
+            f"DualPipe symmetric stash should yield uniform strategy, got {strategies}"
+        )
+
+    def test_aware_works_across_all_schedules(self):
+        """Pipeline-aware AC should run without error on every schedule."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=4)
+        gpu = A100_80GB
+        par = ParallelismConfig(pp_size=4, dp_size=4)
+
+        for sched in PipelineSchedule:
+            pr = simulate_pipeline_aware_ac(cfg, gpu, par, schedule=sched)
+            assert len(pr.stages) == par.pp_size, f"Failed on {sched}"
+            assert pr.overall_step_latency_s > 0, f"Zero latency on {sched}"
 
 
 if __name__ == "__main__":

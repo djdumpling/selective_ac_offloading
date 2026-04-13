@@ -24,7 +24,10 @@ from simulator.environment import (
     simulate_fa_selective_ac,
     simulate_full_ac,
     simulate_no_ac,
+    simulate_pipeline_aware_ac,
+    simulate_pipeline_uniform_ac,
     simulate_selective_ac,
+    print_pipeline_result,
 )
 from simulator.memory_model import get_all_tensors_per_layer
 from simulator.offload_model import effective_pcie_bandwidth
@@ -198,3 +201,60 @@ if __name__ == "__main__":
 
     for name, cfg, gpu, par, note in cases:
         compare_strategies(name, cfg, gpu, par, note=note)
+
+    # ── Pipeline-position-aware AC comparison ────────────────────────────
+    print("\n\n")
+    print("=" * 100)
+    print("  PIPELINE-POSITION-AWARE AC")
+    print("  Under 1F1B, stage p stashes (PP-1-p) microbatch activations.")
+    print("  Early stages need aggressive AC; late stages can afford less.")
+    print("  Pipeline-aware selects the least aggressive strategy that fits per stage.")
+    print("=" * 100)
+
+    pipeline_cases = [
+        (
+            "Llama-7B PP=4",
+            llama_7b(seq_len=4096, micro_batch_size=4),
+            A100_80GB,
+            ParallelismConfig(pp_size=4, dp_size=4),
+        ),
+        (
+            "GPT-3 175B PP=8",
+            gpt3_175b(seq_len=2048, micro_batch_size=1),
+            A100_80GB,
+            ParallelismConfig(tp_size=8, pp_size=8),
+        ),
+    ]
+
+    for name, cfg, gpu, par in pipeline_cases:
+        print(f"\n{'=' * 100}")
+        print(f"  {name} on {gpu.name}  (tp={par.tp_size}, pp={par.pp_size}, dp={par.dp_size})")
+        print(f"{'=' * 100}")
+
+        print("\n  --- Uniform Full AC (current practice) ---")
+        pr_uniform = simulate_pipeline_uniform_ac(cfg, gpu, par, strategy_name="Full AC")
+        print_pipeline_result(pr_uniform)
+
+        print("\n  --- Uniform FA-Selective ---")
+        pr_fa_uniform = simulate_pipeline_uniform_ac(cfg, gpu, par, strategy_name="FA-Selective")
+        print_pipeline_result(pr_fa_uniform)
+
+        print("\n  --- Pipeline-Aware (adaptive per stage) ---")
+        pr_aware = simulate_pipeline_aware_ac(cfg, gpu, par)
+        print_pipeline_result(pr_aware)
+
+        # Summary comparison
+        lat_uniform = pr_uniform.overall_step_latency_s
+        lat_aware = pr_aware.overall_step_latency_s
+        speedup = (lat_uniform / lat_aware - 1.0) * 100 if lat_aware > 0 else 0
+        print(f"\n  Pipeline-aware vs Uniform Full AC: "
+              f"step latency {speedup:+.2f}% "
+              f"({'faster' if speedup > 0 else 'same'})")
+
+        all_uniform_fit = pr_uniform.all_fit
+        all_aware_fit = pr_aware.all_fit
+        if all_aware_fit and not all_uniform_fit:
+            print("  Pipeline-aware enables fitting when uniform does not!")
+        elif all_aware_fit and all_uniform_fit:
+            aware_strategies = [sr.strategy_name for sr in pr_aware.stages]
+            print(f"  Per-stage strategies: {aware_strategies}")
