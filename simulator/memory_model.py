@@ -37,6 +37,7 @@ class TensorInfo:
     size_bytes: float         # Memory footprint in bytes
     recompute_flops: float    # FLOPs to recompute this tensor from kept inputs
     recompute_from: list[str] # Names of tensors required to recompute this one
+    recomputable: bool = True # False for tensors like RNG masks / FA stats
     description: str = ""     # Human-readable description
 
 
@@ -140,6 +141,7 @@ def get_attention_tensors(
                 size_bytes=dropout_mask_bytes,
                 recompute_flops=0,  # Masks can't be recomputed (need same RNG)
                 recompute_from=[],
+                recomputable=False,
                 description="Softmax dropout mask (boolean)",
             ))
 
@@ -164,6 +166,7 @@ def get_attention_tensors(
             size_bytes=fa_lse_bytes,
             recompute_flops=0,  # Part of FA kernel; not independently recomputable
             recompute_from=[],
+            recomputable=False,
             description="FlashAttention logsumexp statistics",
         ))
 
@@ -190,6 +193,7 @@ def get_attention_tensors(
             size_bytes=attn_dropout_bytes,
             recompute_flops=0,
             recompute_from=[],
+            recomputable=False,
             description="Output dropout mask after attention (boolean)",
         ))
 
@@ -285,6 +289,7 @@ def get_mlp_tensors(
             size_bytes=dropout_bytes,
             recompute_flops=0,
             recompute_from=[],
+            recomputable=False,
             description="MLP output dropout mask (boolean)",
         ))
 

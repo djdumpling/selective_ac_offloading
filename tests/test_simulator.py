@@ -38,10 +38,13 @@ from simulator.offload_model import (
     transfer_time,
     round_trip_time,
     can_overlap,
+    effective_pcie_bandwidth,
+    estimate_nccl_pcie_utilization,
 )
 from simulator.compression_model import (
     compressed_size,
     compression_ratio,
+    compression_flops,
     estimate_error,
 )
 from simulator.environment import (
@@ -49,6 +52,7 @@ from simulator.environment import (
     simulate_no_ac,
     simulate_full_ac,
     simulate_selective_ac,
+    simulate_fa_selective_ac,
     print_result,
 )
 
@@ -262,6 +266,14 @@ class TestComputeModel:
         )
         assert get_fwd_flops_mlp(cfg_swiglu) > get_fwd_flops_mlp(cfg_gelu)
 
+    def test_tensor_parallel_reduces_per_rank_flops(self):
+        """TP should reduce the compute assigned to each rank."""
+        cfg = llama_70b(seq_len=4096, micro_batch_size=1)
+        flops_tp1 = get_fwd_flops_per_layer(cfg, ParallelismConfig(tp_size=1))
+        flops_tp8 = get_fwd_flops_per_layer(cfg, ParallelismConfig(tp_size=8))
+        assert flops_tp8 < flops_tp1
+        assert abs(flops_tp1 / flops_tp8 - 8.0) < 0.2
+
 
 class TestOffloadModel:
     """Test PCIe transfer calculations."""
@@ -381,6 +393,39 @@ class TestSimulatorEnvironment:
         r_none = simulate_no_ac(cfg, gpu)
         assert result.peak_activation_memory_bytes < r_none.peak_activation_memory_bytes
 
+    def test_selective_ac_matches_no_ac_with_flash_attention(self):
+        """Attention-only selective AC should be a no-op once FA removes s^2 tensors."""
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        r_none = simulate_no_ac(cfg, gpu)
+        r_sel = simulate_selective_ac(cfg, gpu)
+        assert r_sel.peak_activation_memory_bytes == r_none.peak_activation_memory_bytes
+        assert r_sel.recompute_overhead_pct == 0.0
+
+    def test_invalid_recompute_raises(self):
+        """Strategies should reject impossible recomputations like RNG masks."""
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        strategies = [
+            LayerStrategy(
+                layer_idx=i,
+                decisions={
+                    "attn_dropout_mask": TensorDecision(action=TensorAction.RECOMPUTE),
+                },
+            )
+            for i in range(cfg.num_layers)
+        ]
+        with pytest.raises(ValueError, match="cannot be recomputed"):
+            simulate(cfg, gpu, strategies=strategies)
+
+    def test_pipeline_parallel_reduces_stage_memory(self):
+        """Pipeline stages should hold only their local layer partition."""
+        cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+        r_pp1 = simulate_no_ac(cfg, gpu, par=ParallelismConfig(tp_size=8, pp_size=1))
+        r_pp8 = simulate_no_ac(cfg, gpu, par=ParallelismConfig(tp_size=8, pp_size=8))
+        assert r_pp8.total_peak_memory_bytes < r_pp1.total_peak_memory_bytes
+
     def test_llama_7b_fits_on_a100_with_fsdp(self):
         """Llama 7B with FSDP (dp=8) should fit on A100-80GB.
 
@@ -400,6 +445,198 @@ class TestSimulatorEnvironment:
         cfg = llama_7b(seq_len=2048, micro_batch_size=1)
         result = simulate_no_ac(cfg, A100_80GB)
         print_result(result)
+
+
+class TestCompressionComputeCost:
+    """Verify compression is no longer modeled as free."""
+
+    def test_compression_has_nonzero_flops(self):
+        """Compression round-trip should cost 4×rows×cols×rank FLOPs."""
+        rows, cols, rank = 8192, 4096, 512
+        c, d = compression_flops(rows, cols, rank)
+        assert c == 2 * rows * cols * rank
+        assert d == 2 * rows * rank * cols
+        assert c + d == 4 * rows * cols * rank
+
+    def test_compression_adds_latency(self):
+        """3-Resource with COMPRESS should have higher step latency than No AC."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+        par = ParallelismConfig(dp_size=8)
+
+        r_none = simulate_no_ac(cfg, gpu, par=par)
+
+        # Build a strategy that compresses MLP tensors
+        tensors = get_all_tensors_per_layer(cfg, par)
+        strategies = []
+        for i in range(cfg.num_layers):
+            decisions = {
+                "mlp_linear2_input": TensorDecision(
+                    action=TensorAction.COMPRESS,
+                    compress_rank=cfg.hidden_dim // 8,
+                ),
+            }
+            strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
+
+        r_comp = simulate(cfg, gpu, strategies=strategies, par=par)
+
+        assert r_comp.total_compression_flops > 0
+        assert r_comp.step_latency_s > r_none.step_latency_s, (
+            "Compression should increase step latency"
+        )
+
+    def test_compression_overhead_nontrivial(self):
+        """Compression overhead should be measurable, not negligible."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+        par = ParallelismConfig(dp_size=8)
+
+        tensors = get_all_tensors_per_layer(cfg, par)
+        strategies = []
+        for i in range(cfg.num_layers):
+            decisions = {
+                "mlp_linear2_input": TensorDecision(
+                    action=TensorAction.COMPRESS,
+                    compress_rank=cfg.hidden_dim // 8,
+                ),
+            }
+            strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
+
+        r = simulate(cfg, gpu, strategies=strategies, par=par)
+        # Overhead should be > 0.1% (not negligible)
+        assert r.recompute_overhead_pct > 0.1, (
+            f"Compression overhead should be nontrivial, got {r.recompute_overhead_pct:.3f}%"
+        )
+
+
+class TestPCIeContention:
+    """Verify NCCL contention reduces effective offload bandwidth."""
+
+    def test_no_contention_without_fsdp(self):
+        """Single GPU (no parallelism) → full PCIe bandwidth."""
+        par = ParallelismConfig()
+        util = estimate_nccl_pcie_utilization(A100_80GB, par)
+        assert util == 0.0
+
+    def test_contention_with_multinode_fsdp(self):
+        """Multi-node FSDP → reduced PCIe bandwidth."""
+        par = ParallelismConfig(dp_size=16)  # Multi-node
+        util = estimate_nccl_pcie_utilization(A100_80GB, par)
+        assert util > 0.0, "NCCL should consume some PCIe bandwidth"
+
+    def test_effective_bw_less_than_raw(self):
+        """Effective bandwidth should be less than raw with FSDP."""
+        par = ParallelismConfig(dp_size=16)
+        eff = effective_pcie_bandwidth(A100_80GB, par)
+        raw = A100_80GB.pcie_bandwidth_bytes_s
+        assert eff < raw, "Effective BW should be reduced by NCCL contention"
+
+    def test_offload_slower_with_contention(self):
+        """Same tensor should take longer to offload when PCIe is contested."""
+        from simulator.memory_model import TensorInfo
+        tensor = TensorInfo(
+            name="test", block="mlp",
+            size_bytes=100 * 1024 ** 2,  # 100 MB
+            recompute_flops=0, recompute_from=[],
+        )
+        par_none = ParallelismConfig()
+        par_fsdp = ParallelismConfig(dp_size=16)
+
+        t_none = transfer_time(tensor.size_bytes, A100_80GB, par_none)
+        t_fsdp = transfer_time(tensor.size_bytes, A100_80GB, par_fsdp)
+
+        assert t_fsdp > t_none, (
+            f"Transfer with FSDP contention ({t_fsdp*1000:.2f}ms) should be "
+            f"slower than without ({t_none*1000:.2f}ms)"
+        )
+
+    def test_offload_stalls_appear_with_contention(self):
+        """With reduced PCIe BW, offloading should produce stalls."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+
+        # No contention case
+        par_tp = ParallelismConfig(tp_size=8)
+        tensors = get_all_tensors_per_layer(cfg, par_tp)
+        strategies = []
+        for i in range(cfg.num_layers):
+            decisions = {
+                "mlp_gate_output": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+                "mlp_up_output": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+                "mlp_linear2_input": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+            }
+            strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
+        r_tp = simulate(cfg, gpu, strategies=strategies, par=par_tp)
+
+        # With contention case
+        par_fsdp = ParallelismConfig(dp_size=16)
+        tensors = get_all_tensors_per_layer(cfg, par_fsdp)
+        strategies_fsdp = []
+        for i in range(cfg.num_layers):
+            decisions = {
+                "mlp_gate_output": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+                "mlp_up_output": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+                "mlp_linear2_input": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+            }
+            strategies_fsdp.append(LayerStrategy(layer_idx=i, decisions=decisions))
+        r_fsdp = simulate(cfg, gpu, strategies=strategies_fsdp, par=par_fsdp)
+
+        assert r_fsdp.total_offload_stall_s >= r_tp.total_offload_stall_s, (
+            "FSDP contention should produce equal or more offload stalls"
+        )
+
+
+class TestFAEraSelectiveAC:
+    """Test the FA-era selective recompute strategy."""
+
+    def test_saves_memory_vs_no_ac(self):
+        """FA-era selective should save memory by recomputing mlp_linear2_input."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+        par = ParallelismConfig(dp_size=8)
+
+        r_none = simulate_no_ac(cfg, gpu, par=par)
+        r_fa_sel = simulate_fa_selective_ac(cfg, gpu, par=par)
+
+        assert r_fa_sel.peak_activation_memory_bytes < r_none.peak_activation_memory_bytes
+
+    def test_much_less_overhead_than_full_ac(self):
+        """FA-era selective should have far less overhead than full AC."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+        par = ParallelismConfig(dp_size=8)
+
+        r_full = simulate_full_ac(cfg, gpu, par=par)
+        r_fa_sel = simulate_fa_selective_ac(cfg, gpu, par=par)
+
+        assert r_fa_sel.recompute_overhead_pct < r_full.recompute_overhead_pct / 5, (
+            f"FA-era selective ({r_fa_sel.recompute_overhead_pct:.2f}%) should be "
+            f"<< full AC ({r_full.recompute_overhead_pct:.2f}%)"
+        )
+
+    def test_overhead_under_2_percent(self):
+        """Recomputing pointwise activation should cost <2% overhead."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=2)
+        gpu = A100_80GB
+        par = ParallelismConfig(dp_size=8)
+
+        r = simulate_fa_selective_ac(cfg, gpu, par=par)
+        assert r.recompute_overhead_pct < 2.0, (
+            f"FA-era selective overhead should be tiny, got {r.recompute_overhead_pct:.2f}%"
+        )
+
+    def test_only_recomputes_linear2_input(self):
+        """Should only recompute mlp_linear2_input, nothing else."""
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        gpu = A100_80GB
+
+        r = simulate_fa_selective_ac(cfg, gpu)
+        layer0 = r.per_layer[0]
+        for tname, action in layer0.tensor_details.items():
+            if tname == "mlp_linear2_input":
+                assert action == "RECOMPUTE"
+            else:
+                assert action == "KEEP", f"{tname} should be KEEP, got {action}"
 
 
 if __name__ == "__main__":

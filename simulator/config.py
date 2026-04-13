@@ -247,3 +247,45 @@ def gpt3_175b(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
         activation_fn=ActivationFunction.GELU,
         use_flash_attention=False,  # Original GPT-3 didn't use FA
     )
+
+
+def gpt3_22b(seq_len: int = 2048, micro_batch_size: int = 4) -> ModelConfig:
+    return ModelConfig(
+        name="gpt3-22b",
+        num_layers=48,
+        hidden_dim=6144,
+        n_heads=64,
+        vocab_size=50257,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=False,
+    )
+
+
+def mt_nlg_530b(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
+    return ModelConfig(
+        name="mt-nlg-530b",
+        num_layers=105,
+        hidden_dim=20480,
+        n_heads=128,
+        vocab_size=50257,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=False,
+    )
+
+
+def gpt3_1t(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
+    return ModelConfig(
+        name="gpt3-1t",
+        num_layers=128,
+        hidden_dim=25600,
+        n_heads=160,
+        vocab_size=50257,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=False,
+    )

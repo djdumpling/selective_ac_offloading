@@ -35,17 +35,19 @@ def get_fwd_flops_attn(cfg: ModelConfig, par: ParallelismConfig = ParallelismCon
                + 4·b·s²·h (attention scores + weighted sum)
     """
     s, b, h = cfg.seq_len, cfg.micro_batch_size, cfg.hidden_dim
+    tp = par.tp_size
 
     # Q and output projections: each 2·b·s·h² FLOPs
-    qo_flops = 4 * b * s * h * h
+    qo_flops = 4 * b * s * h * h / tp
 
     # K and V projections (with GQA): each 2·b·s·(h/num_kv_groups)·h
-    kv_flops = 4 * b * s * h * h / cfg.num_kv_groups
+    kv_flops = 4 * b * s * h * h / cfg.num_kv_groups / tp
 
-    # Attention score computation: QK^T + softmax·V
+    # Attention score computation: QK^T + softmax·V.
+    # Under tensor-parallel attention, each rank handles 1/tp of the heads.
     # QK^T: 2·b·a·s²·d_k = 2·b·s²·h  (since a·d_k = h)
     # Attn·V: 2·b·a·s²·d_k = 2·b·s²·h
-    attn_flops = 4 * b * s * s * h
+    attn_flops = 4 * b * s * s * h / tp
 
     return qo_flops + kv_flops + attn_flops
 
@@ -58,9 +60,10 @@ def get_fwd_flops_mlp(cfg: ModelConfig, par: ParallelismConfig = ParallelismConf
     """
     s, b, h = cfg.seq_len, cfg.micro_batch_size, cfg.hidden_dim
     ffn = cfg.ffn_dim
+    tp = par.tp_size
 
     multiplier = 6 if cfg.is_swiglu else 4
-    return multiplier * b * s * h * ffn
+    return multiplier * b * s * h * ffn / tp
 
 
 def get_fwd_flops_per_layer(cfg: ModelConfig, par: ParallelismConfig = ParallelismConfig()) -> float:

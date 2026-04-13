@@ -1,103 +1,200 @@
-"""Demo: compare AC strategies on Llama-7B and GPT-3 175B."""
+"""Demo: compare activation strategies with realistic cost modeling.
+
+Now includes:
+- FA-era selective AC (recompute activation functions, keep matmul outputs)
+- Compression compute cost (no longer modeled as free)
+- PCIe contention from NCCL (offload bandwidth reduced under FSDP)
+"""
 
 from simulator.config import (
+    A100_40GB,
     A100_80GB,
     H100_80GB,
+    LayerStrategy,
     ParallelismConfig,
     TensorAction,
     TensorDecision,
-    LayerStrategy,
-    llama_7b,
-    llama_70b,
     gpt3_175b,
-)
-from simulator.memory_model import (
-    get_all_tensors_per_layer,
-    get_korthikanti_reference,
+    llama_7b,
+    llama_13b,
+    llama_70b,
 )
 from simulator.environment import (
     simulate,
-    simulate_no_ac,
+    simulate_fa_selective_ac,
     simulate_full_ac,
+    simulate_no_ac,
     simulate_selective_ac,
-    print_result,
 )
+from simulator.memory_model import get_all_tensors_per_layer
+from simulator.offload_model import effective_pcie_bandwidth
 
 
 def _gb(x: float) -> str:
     return f"{x / 1024**3:.2f} GB"
 
 
-def compare_strategies(name, cfg, gpu, par=ParallelismConfig()):
-    print(f"\n{'='*70}")
-    print(f"  {name} on {gpu.name}  (seq={cfg.seq_len}, mbs={cfg.micro_batch_size})")
-    print(f"{'='*70}")
+def _ms(x: float) -> str:
+    return f"{x * 1000:.2f}"
+
+
+def _compression_rank(cfg, par: ParallelismConfig) -> int:
+    rows = cfg.seq_len * cfg.micro_batch_size
+    cols = cfg.ffn_dim // par.tp_size
+    target = max(1, cfg.hidden_dim // 8)
+    return min(target, rows, cols)
+
+
+def build_three_resource_strategy(cfg, par=ParallelismConfig()):
+    """Hybrid: offload large MLP tensors + compress linear2 + recompute attn core (non-FA)."""
+    tensors = get_all_tensors_per_layer(cfg, par)
+    rank = _compression_rank(cfg, par)
+    strategies = []
+
+    for layer_idx in range(cfg.num_layers):
+        decisions = {}
+        for tensor in tensors:
+            if not cfg.use_flash_attention and tensor.name in {
+                "attn_softmax",
+                "attn_softmax_dropout_output",
+            }:
+                decisions[tensor.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+            elif tensor.name in {
+                "mlp_gate_output",
+                "mlp_up_output",
+                "mlp_gelu_input",
+            }:
+                decisions[tensor.name] = TensorDecision(action=TensorAction.OFFLOAD_CPU)
+            elif tensor.name == "mlp_linear2_input":
+                decisions[tensor.name] = TensorDecision(
+                    action=TensorAction.COMPRESS,
+                    compress_rank=rank,
+                )
+        strategies.append(LayerStrategy(layer_idx=layer_idx, decisions=decisions))
+
+    return strategies
+
+
+def compare_strategies(name, cfg, gpu, par=ParallelismConfig(), note=""):
+    print(f"\n{'=' * 100}")
+    print(
+        f"  {name} on {gpu.name}"
+        f"  (seq={cfg.seq_len}, mbs={cfg.micro_batch_size}, "
+        f"tp={par.tp_size}, pp={par.pp_size}, dp={par.dp_size})"
+    )
+    if note:
+        print(f"  {note}")
+
+    # Show effective PCIe bandwidth
+    eff_bw = effective_pcie_bandwidth(gpu, par) / (1024 ** 3)
+    raw_bw = gpu.pcie_bandwidth_gb_s
+    if eff_bw < raw_bw:
+        print(f"  PCIe: {raw_bw:.0f} GB/s raw → {eff_bw:.1f} GB/s effective (NCCL contention)")
+    else:
+        print(f"  PCIe: {raw_bw:.0f} GB/s (no contention)")
+    print(f"{'=' * 100}")
 
     results = {
         "No AC": simulate_no_ac(cfg, gpu, par=par),
         "Full AC": simulate_full_ac(cfg, gpu, par=par),
         "Selective AC": simulate_selective_ac(cfg, gpu, par=par),
+        "FA-Selective": simulate_fa_selective_ac(cfg, gpu, par=par),
+        "3-Resource": simulate(
+            cfg, gpu,
+            strategies=build_three_resource_strategy(cfg, par),
+            par=par,
+        ),
     }
 
-    # Custom "FA-aware" strategy: keep attention (FA handles it),
-    # offload large MLP tensors, recompute dropout masks
-    tensors = get_all_tensors_per_layer(cfg, par)
-    strategies = []
-    for i in range(cfg.num_layers):
-        decisions = {}
-        for t in tensors:
-            if "gate_output" in t.name or "up_output" in t.name or "gelu_input" in t.name:
-                decisions[t.name] = TensorDecision(action=TensorAction.OFFLOAD_CPU)
-            elif "linear2_input" in t.name:
-                decisions[t.name] = TensorDecision(action=TensorAction.COMPRESS, compress_rank=cfg.hidden_dim // 8)
-            elif "dropout_mask" in t.name:
-                decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
-            # Everything else: KEEP (default)
-        strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
-
-    results["3-Resource (offload+compress+recompute)"] = simulate(
-        cfg, gpu, strategies=strategies, par=par
+    print(
+        f"\n  {'Strategy':<16} {'Activation':>12} {'Peak Total':>12} "
+        f"{'Step (ms)':>10} {'Overhead%':>10} {'Fits?':>6}"
+    )
+    print(
+        f"  {'-' * 16} {'-' * 12} {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 6}"
     )
 
-    print(f"\n  {'Strategy':<42} {'Activation':>12} {'Peak Total':>12} {'Recomp%':>8} {'Fits?':>6}")
-    print(f"  {'-'*42} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
-    for sname, r in results.items():
-        fits = "YES" if r.fits_in_memory else "NO"
-        print(f"  {sname:<42} {_gb(r.peak_activation_memory_bytes):>12} "
-              f"{_gb(r.total_peak_memory_bytes):>12} "
-              f"{r.recompute_overhead_pct:>7.2f}% {fits:>6}")
+    baseline_step = results["No AC"].step_latency_s
 
-    # Show per-tensor breakdown for 3-resource strategy (layer 0)
-    r3 = results["3-Resource (offload+compress+recompute)"]
-    print(f"\n  Layer 0 tensor decisions (3-Resource):")
-    for tname, action in r3.per_layer[0].tensor_details.items():
-        print(f"    {tname:<30} {action}")
+    for sname, result in results.items():
+        fits = "YES" if result.fits_in_memory else "NO"
+        # Show overhead as % increase in step latency over No AC
+        step_overhead = (
+            100.0 * (result.step_latency_s / baseline_step - 1.0)
+            if baseline_step > 0 else 0.0
+        )
+        print(
+            f"  {sname:<16} {_gb(result.peak_activation_memory_bytes):>12} "
+            f"{_gb(result.total_peak_memory_bytes):>12} "
+            f"{_ms(result.step_latency_s):>10} "
+            f"{step_overhead:>+9.2f}% {fits:>6}"
+        )
+
+    # Compare FA-Selective vs No AC (the meaningful comparison for FA models)
+    fa_sel = results["FA-Selective"]
+    no_ac = results["No AC"]
+    mem_saved = 100.0 * (1.0 - fa_sel.peak_activation_memory_bytes / no_ac.peak_activation_memory_bytes)
+    step_cost = 100.0 * (fa_sel.step_latency_s / no_ac.step_latency_s - 1.0)
+    print(
+        f"\n  FA-Selective vs No AC: "
+        f"activation memory -{mem_saved:.1f}%, step latency {step_cost:+.2f}%"
+    )
+
+    # Compare 3-Resource vs FA-Selective
+    hybrid = results["3-Resource"]
+    mem_saved_3r = 100.0 * (1.0 - hybrid.peak_activation_memory_bytes / fa_sel.peak_activation_memory_bytes)
+    step_cost_3r = 100.0 * (hybrid.step_latency_s / fa_sel.step_latency_s - 1.0)
+    print(
+        f"  3-Resource vs FA-Selective: "
+        f"activation memory {mem_saved_3r:+.1f}%, step latency {step_cost_3r:+.2f}%"
+    )
 
 
 if __name__ == "__main__":
-    # ── Llama-7B on A100-80GB with FSDP ─────────────────────────────────
-    compare_strategies(
-        "Llama-7B",
-        llama_7b(seq_len=4096, micro_batch_size=2),
-        A100_80GB,
-        par=ParallelismConfig(dp_size=8),
-    )
+    print("=" * 100)
+    print("  REALISTIC COST MODEL DEMO")
+    print("  - Compression compute cost: 4×sb×d×r FLOPs per compressed tensor")
+    print("  - PCIe contention: FSDP NCCL traffic reduces available offload bandwidth")
+    print("  - FA-era selective: recompute activation functions, keep matmul outputs")
+    print("=" * 100)
 
-    # ── Llama-70B on H100 with TP=8 ─────────────────────────────────────
-    compare_strategies(
-        "Llama-70B",
-        llama_70b(seq_len=4096, micro_batch_size=1),
-        H100_80GB,
-        par=ParallelismConfig(tp_size=8, dp_size=8),
-    )
+    cases = [
+        (
+            "Llama-7B",
+            llama_7b(seq_len=4096, micro_batch_size=2),
+            A100_80GB,
+            ParallelismConfig(dp_size=8),
+            "FSDP dp=8 (NCCL contention on PCIe)",
+        ),
+        (
+            "Llama-7B",
+            llama_7b(seq_len=4096, micro_batch_size=2),
+            A100_80GB,
+            ParallelismConfig(tp_size=8),
+            "TP=8 on NVLink (no PCIe contention)",
+        ),
+        (
+            "Llama-13B",
+            llama_13b(seq_len=4096, micro_batch_size=1),
+            A100_80GB,
+            ParallelismConfig(dp_size=8),
+            "FSDP dp=8",
+        ),
+        (
+            "Llama-70B",
+            llama_70b(seq_len=4096, micro_batch_size=1),
+            H100_80GB,
+            ParallelismConfig(tp_size=8, dp_size=8),
+            "TP=8 + FSDP dp=8 (multi-node)",
+        ),
+        (
+            "GPT-3 175B",
+            gpt3_175b(seq_len=2048, micro_batch_size=1),
+            A100_80GB,
+            ParallelismConfig(tp_size=8, pp_size=8),
+            "Korthikanti Table 3 (no FA)",
+        ),
+    ]
 
-    # ── Korthikanti reference check ──────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"  Korthikanti Reference Formulas (GPT-3 175B, no FA)")
-    print(f"{'='*70}")
-    cfg = gpt3_175b(seq_len=2048, micro_batch_size=1)
-    ref = get_korthikanti_reference(cfg)
-    print(f"  No AC per layer:        {_gb(ref['no_ac'])}")
-    print(f"  Selective AC per layer: {_gb(ref['selective_ac'])}")
-    print(f"  Full AC per layer:      {_gb(ref['full_ac'])}")
-    print(f"  No AC total (96 layers): {_gb(ref['no_ac'] * 96)}")
+    for name, cfg, gpu, par, note in cases:
+        compare_strategies(name, cfg, gpu, par, note=note)

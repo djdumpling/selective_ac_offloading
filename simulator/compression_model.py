@@ -1,7 +1,7 @@
 """Low-rank activation compression model.
 
-Estimates memory savings and approximation error from compressing
-activation tensors via low-rank decomposition.
+Estimates memory savings, approximation error, **and compute cost** from
+compressing activation tensors via low-rank decomposition.
 
 Reference: LoRAct (Shi et al., 2025) achieves ~80% memory reduction at
 rank r = d/8 with bounded error.
@@ -11,6 +11,13 @@ For a tensor A of shape [s·b, d]:
 - Rank-r compressed: store U [s·b, r] and V [r, d] = s·b·r + r·d elements
 - Compression ratio: (s·b·r + r·d) / (s·b·d)
 - When s·b >> d (typical for activations): ratio ≈ r/d
+
+Compute cost (previously ignored, now modeled):
+- Forward (compress):  random projection A @ Ω where Ω is [d, r]
+  → 2 × s·b × d × r FLOPs  (one matmul)
+- Backward (reconstruct): U @ V^T to recover the approximation
+  → 2 × s·b × r × d FLOPs  (one matmul)
+- Total round-trip: 4 × s·b × d × r FLOPs
 """
 
 from __future__ import annotations
@@ -30,6 +37,9 @@ class CompressionResult:
     compression_ratio: float      # compressed / original (lower is better)
     memory_saved_bytes: float
     estimated_relative_error: float
+    compress_flops: float         # FLOPs to compress in forward
+    decompress_flops: float       # FLOPs to decompress in backward
+    total_flops: float            # Round-trip compute cost
 
 
 def compressed_size(
@@ -47,6 +57,22 @@ def compression_ratio(rows: int, cols: int, rank: int) -> float:
     original = rows * cols
     comp = rows * rank + rank * cols
     return comp / original
+
+
+def compression_flops(rows: int, cols: int, rank: int) -> tuple[float, float]:
+    """Compute cost for compression and decompression.
+
+    Forward (compress): A @ Ω where A is [rows, cols], Ω is [cols, rank]
+        → 2 × rows × cols × rank FLOPs
+
+    Backward (decompress): U @ V^T where U is [rows, rank], V is [rank, cols]
+        → 2 × rows × rank × cols FLOPs
+
+    Returns (compress_flops, decompress_flops).
+    """
+    compress = 2 * rows * cols * rank
+    decompress = 2 * rows * rank * cols  # same magnitude, different operation
+    return compress, decompress
 
 
 def estimate_error(rank: int, full_dim: int, spectral_decay: float = 1.0) -> float:
@@ -100,6 +126,7 @@ def compress_tensor(
     comp_bytes = compressed_size(seq_batch, feature_dim, rank, bytes_per_element)
     ratio = compression_ratio(seq_batch, feature_dim, rank)
     error = estimate_error(rank, feature_dim, spectral_decay)
+    c_flops, d_flops = compression_flops(seq_batch, feature_dim, rank)
 
     return CompressionResult(
         tensor_name=tensor.name,
@@ -108,4 +135,7 @@ def compress_tensor(
         compression_ratio=ratio,
         memory_saved_bytes=max(0.0, tensor.size_bytes - comp_bytes),
         estimated_relative_error=error,
+        compress_flops=c_flops,
+        decompress_flops=d_flops,
+        total_flops=c_flops + d_flops,
     )

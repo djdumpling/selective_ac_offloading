@@ -52,6 +52,7 @@ class LayerMemoryBreakdown:
     compressed_stored_bytes: float = 0.0
     recompute_flops: float = 0.0
     offload_stall_s: float = 0.0
+    compression_flops: float = 0.0
     compression_error: float = 0.0
     tensor_details: dict[str, str] = field(default_factory=dict)
 
@@ -77,6 +78,7 @@ class SimulatorResult:
     total_recompute_flops: float
     recompute_overhead_pct: float
     total_offload_stall_s: float
+    total_compression_flops: float
     total_compression_error: float
 
     # Per-layer breakdown
@@ -94,12 +96,10 @@ class SimulatorResult:
 
 # ── Helper: parameter / optimizer / gradient memory ──────────────────────────
 
-def _param_count(cfg: ModelConfig) -> int:
-    """Approximate parameter count for a transformer model."""
+def _layer_param_count(cfg: ModelConfig) -> int:
+    """Approximate parameter count for one transformer layer."""
     h = cfg.hidden_dim
     ffn = cfg.ffn_dim
-    L = cfg.num_layers
-    V = cfg.vocab_size
     kv_groups = cfg.num_kv_groups
 
     # Per-layer params:
@@ -113,29 +113,73 @@ def _param_count(cfg: ModelConfig) -> int:
     # LayerNorm: 2 × (weight + bias) = 2 × 2h = 4h
     ln_params = 4 * h
 
-    per_layer = attn_params + mlp_params + ln_params
-    # Embedding + final LN + output head
-    embedding = V * h
-    final_ln = 2 * h
-    # Output head often shares weights with embedding
-    output_head = 0  # weight-tied
-
-    return L * per_layer + embedding + final_ln + output_head
+    return attn_params + mlp_params + ln_params
 
 
-def _param_memory(cfg: ModelConfig, par: ParallelismConfig) -> float:
+def _stage_layer_span(
+    num_layers: int,
+    pp_size: int,
+    pipeline_stage: int,
+) -> tuple[int, int]:
+    """Inclusive-exclusive layer range handled by one pipeline stage."""
+    if pp_size <= 1:
+        return 0, num_layers
+    if pipeline_stage < 0 or pipeline_stage >= pp_size:
+        raise ValueError(
+            f"pipeline_stage={pipeline_stage} must be in [0, {pp_size - 1}]"
+        )
+
+    base = num_layers // pp_size
+    extra = num_layers % pp_size
+    start = pipeline_stage * base + min(pipeline_stage, extra)
+    count = base + (1 if pipeline_stage < extra else 0)
+    return start, start + count
+
+
+def _param_count(
+    cfg: ModelConfig,
+    par: ParallelismConfig,
+    pipeline_stage: int,
+) -> int:
+    """Approximate parameter count resident on one pipeline stage."""
+    start, end = _stage_layer_span(cfg.num_layers, par.pp_size, pipeline_stage)
+    local_layers = end - start
+    count = local_layers * _layer_param_count(cfg)
+
+    # Embeddings typically live on the first stage; final LN/head on the last.
+    if pipeline_stage == 0:
+        count += cfg.vocab_size * cfg.hidden_dim
+    if pipeline_stage == par.pp_size - 1:
+        count += 2 * cfg.hidden_dim
+
+    return count
+
+
+def _param_memory(
+    cfg: ModelConfig,
+    par: ParallelismConfig,
+    pipeline_stage: int,
+) -> float:
     """Parameter memory in bytes (bf16 weights)."""
-    return _param_count(cfg) * BYTES_BF16 / par.tp_size
+    return _param_count(cfg, par, pipeline_stage) * BYTES_BF16 / par.tp_size
 
 
-def _optimizer_memory(cfg: ModelConfig, par: ParallelismConfig) -> float:
+def _optimizer_memory(
+    cfg: ModelConfig,
+    par: ParallelismConfig,
+    pipeline_stage: int,
+) -> float:
     """Optimizer state memory (Adam: 12 bytes/param for fp32 copies + m + v)."""
-    return _param_count(cfg) * 12 / par.tp_size / par.dp_size
+    return _param_count(cfg, par, pipeline_stage) * 12 / par.tp_size / par.dp_size
 
 
-def _gradient_memory(cfg: ModelConfig, par: ParallelismConfig) -> float:
+def _gradient_memory(
+    cfg: ModelConfig,
+    par: ParallelismConfig,
+    pipeline_stage: int,
+) -> float:
     """Gradient memory (same dtype as params)."""
-    return _param_count(cfg) * BYTES_BF16 / par.tp_size
+    return _param_count(cfg, par, pipeline_stage) * BYTES_BF16 / par.tp_size
 
 
 # ── Liveness gap estimation ─────────────────────────────────────────────────
@@ -198,30 +242,34 @@ def simulate(
         num_microbatches_in_flight: For pipeline parallelism, how many
             microbatch activations are stashed at this stage.
     """
-    num_layers = cfg.num_layers
+    start_layer, end_layer = _stage_layer_span(
+        cfg.num_layers, par.pp_size, pipeline_stage)
+    layer_indices = list(range(start_layer, end_layer))
+    num_local_layers = len(layer_indices)
     layer_compute = get_layer_compute_profile(cfg, gpu, par, efficiency)
 
     # Pad strategies if needed
     strategy_map: dict[int, LayerStrategy] = {s.layer_idx: s for s in strategies}
 
     # Fixed memory components
-    param_mem = _param_memory(cfg, par)
-    optim_mem = _optimizer_memory(cfg, par)
-    grad_mem = _gradient_memory(cfg, par)
+    param_mem = _param_memory(cfg, par, pipeline_stage)
+    optim_mem = _optimizer_memory(cfg, par, pipeline_stage)
+    grad_mem = _gradient_memory(cfg, par, pipeline_stage)
 
     # Process each layer
     per_layer_results: list[LayerMemoryBreakdown] = []
     total_recompute_flops = 0.0
     total_offload_stall = 0.0
+    total_compression_flops = 0.0
     total_compression_error = 0.0
 
-    for layer_idx in range(num_layers):
+    for local_idx, layer_idx in enumerate(layer_indices):
         tensors = get_all_tensors_per_layer(cfg, par)
         strategy = strategy_map.get(layer_idx)
         breakdown = LayerMemoryBreakdown(layer_idx=layer_idx)
 
         liveness_gap_boundary = _estimate_liveness_gap(
-            layer_idx, num_layers, layer_compute)
+            local_idx, num_local_layers, layer_compute)
         liveness_gap_intra = _estimate_intra_block_liveness_gap(layer_compute)
 
         for tensor in tensors:
@@ -240,18 +288,23 @@ def simulate(
                 breakdown.tensor_details[tensor.name] = "KEEP"
 
             elif decision.action == TensorAction.RECOMPUTE:
+                if not tensor.recomputable:
+                    raise ValueError(
+                        f"Tensor {tensor.name} cannot be recomputed directly."
+                    )
                 breakdown.recomputed_bytes += tensor.size_bytes
                 breakdown.recompute_flops += tensor.recompute_flops
                 total_recompute_flops += tensor.recompute_flops
                 breakdown.tensor_details[tensor.name] = "RECOMPUTE"
 
             elif decision.action == TensorAction.OFFLOAD_CPU:
-                result = compute_offload_result(tensor, gap, gpu)
+                result = compute_offload_result(tensor, gap, gpu, par)
                 breakdown.offloaded_bytes += tensor.size_bytes
                 breakdown.offload_stall_s += result.stall_time_s
                 total_offload_stall += result.stall_time_s
                 breakdown.tensor_details[tensor.name] = (
-                    f"OFFLOAD (stall={result.stall_time_s * 1000:.2f}ms)"
+                    f"OFFLOAD (stall={result.stall_time_s * 1000:.2f}ms, "
+                    f"eff_bw={result.effective_bw_gb_s:.1f}GB/s)"
                 )
 
             elif decision.action == TensorAction.COMPRESS:
@@ -269,13 +322,16 @@ def simulate(
                 )
                 breakdown.compressed_original_bytes += comp.original_bytes
                 breakdown.compressed_stored_bytes += comp.compressed_bytes
+                breakdown.compression_flops += comp.total_flops
+                total_compression_flops += comp.total_flops
                 breakdown.compression_error = max(
                     breakdown.compression_error, comp.estimated_relative_error)
                 total_compression_error = max(
                     total_compression_error, comp.estimated_relative_error)
                 breakdown.tensor_details[tensor.name] = (
                     f"COMPRESS r={decision.compress_rank} "
-                    f"({comp.compression_ratio:.2f}x, err={comp.estimated_relative_error:.4f})"
+                    f"({comp.compression_ratio:.2f}x, err={comp.estimated_relative_error:.4f}, "
+                    f"flops={comp.total_flops:.2e})"
                 )
 
         per_layer_results.append(breakdown)
@@ -288,8 +344,7 @@ def simulate(
 
     # Pipeline stashing: early stages hold (s-1) microbatch activations
     # Each stashed microbatch has the same activation footprint
-    activation_per_microbatch = total_activation_memory / num_layers  # per-layer avg
-    stashed_bytes = num_microbatches_in_flight * activation_per_microbatch
+    stashed_bytes = num_microbatches_in_flight * total_activation_memory
 
     # Peak memory across the training step
     # During backward: activations + gradients + params + optimizer
@@ -297,16 +352,18 @@ def simulate(
     total_peak = param_mem + optim_mem + grad_mem + peak_activation
 
     # Compute overhead
-    fwd_flops = get_fwd_flops_per_layer(cfg, par) * num_layers
+    fwd_flops = get_fwd_flops_per_layer(cfg, par) * num_local_layers
     training_flops = 3 * fwd_flops
-    recompute_pct = (total_recompute_flops / training_flops * 100
+    extra_flops = total_recompute_flops + total_compression_flops
+    recompute_pct = (extra_flops / training_flops * 100
                      if training_flops > 0 else 0.0)
 
     # Latency
-    fwd_lat = layer_compute.fwd_total_latency_s * num_layers
-    bwd_lat = layer_compute.bwd_total_latency_s * num_layers
+    fwd_lat = layer_compute.fwd_total_latency_s * num_local_layers
+    bwd_lat = layer_compute.bwd_total_latency_s * num_local_layers
     recompute_lat = flops_to_latency(total_recompute_flops, gpu, efficiency)
-    step_lat = fwd_lat + bwd_lat + recompute_lat + total_offload_stall
+    compression_lat = flops_to_latency(total_compression_flops, gpu, efficiency)
+    step_lat = fwd_lat + bwd_lat + recompute_lat + compression_lat + total_offload_stall
 
     hbm_capacity = gpu.hbm_capacity_bytes * memory_budget_frac
 
@@ -321,6 +378,7 @@ def simulate(
         total_recompute_flops=total_recompute_flops,
         recompute_overhead_pct=recompute_pct,
         total_offload_stall_s=total_offload_stall,
+        total_compression_flops=total_compression_flops,
         total_compression_error=total_compression_error,
         per_layer=per_layer_results,
         fwd_latency_s=fwd_lat,
@@ -376,15 +434,53 @@ def simulate_selective_ac(
     dropout while keeping all MLP activations.
     """
     tensors = get_all_tensors_per_layer(cfg, par)
-    recompute_names = {
-        "attn_softmax", "attn_softmax_dropout_mask",
-        "attn_softmax_dropout_output", "attn_out_proj_input",
-    }
+    recompute_names = {"attn_softmax"}
+    if cfg.use_softmax_dropout:
+        recompute_names.add("attn_softmax_dropout_output")
     strategies = []
     for i in range(cfg.num_layers):
         decisions = {}
         for t in tensors:
-            if t.name in recompute_names:
+            if not cfg.use_flash_attention and t.name in recompute_names:
+                decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+            else:
+                decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+        strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
+    return simulate(cfg, gpu, strategies=strategies, par=par, **kwargs)
+
+
+def simulate_fa_selective_ac(
+    cfg: ModelConfig,
+    gpu: GPUConfig,
+    par: ParallelismConfig = ParallelismConfig(),
+    **kwargs,
+) -> SimulatorResult:
+    """Simulate FA-era selective AC: recompute activation functions, keep matmul outputs.
+
+    This is the FA-era analogue of Korthikanti's strategy.  With FA active,
+    the attention core is already memory-efficient.  The new bottleneck is
+    the MLP block.  This strategy:
+
+    - Keeps all attention tensors (FA handles them)
+    - Keeps MLP matmul outputs (gate_output, up_output, gelu_input)
+      because they're expensive to recompute (full matmul)
+    - Recomputes mlp_linear2_input: this is GeLU(gelu_input) or
+      SiLU(gate)*up, which is a cheap pointwise op
+
+    The principle is identical to Korthikanti: recompute the cheapest
+    operation that frees the most memory.
+
+    For GELU MLP:  saves 8sbh/tp per layer (mlp_linear2_input)
+                   at cost of GeLU recompute (~8 FLOPs per element)
+    For SwiGLU MLP: saves ffn*sb*bpe/tp per layer (mlp_linear2_input)
+                    at cost of SiLU + elementwise mul
+    """
+    tensors = get_all_tensors_per_layer(cfg, par)
+    strategies = []
+    for i in range(cfg.num_layers):
+        decisions = {}
+        for t in tensors:
+            if t.name == "mlp_linear2_input":
                 decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
             else:
                 decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
