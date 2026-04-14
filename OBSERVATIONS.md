@@ -27,10 +27,14 @@ MLP (SwiGLU):              ~4 × ffn × sb × bpe / tp + sbh × bpe / sp  (gate,
 LayerNorm:                 2 × sbh × 4 / sp   (fp32 inputs)
 ```
 
-For Llama-7B (h=4096, ffn=11008, tp=1): attention is ~14 × 4096 × 2 = 112K elements per
-token, MLP is ~4 × 11008 × 2 + 4096 × 2 = 96K elements per token. The MLP block is still
-the primary target for cheap recomputation — specifically `mlp_silu_output`, the SiLU
-activation output saved by the elementwise multiply backward (see Bug Fix 5 below).
+For Llama-7B (MHA, h=4096, ffn=11008, tp=1): attention is ~14 × 4096 × 2 = 112K elements
+per token, MLP is ~4 × 11008 × 2 + 4096 × 2 = 96K elements per token. They're roughly
+balanced — but with **GQA** (e.g., Qwen3-8B: 8 KV heads), K/V tensors shrink 4×, making
+attention even cheaper and MLP even more dominant (~46% of per-layer activation memory).
+
+The MLP is the primary target for cheap recomputation — specifically `mlp_silu_output`, the
+SiLU activation output saved by the elementwise multiply backward (see Bug Fix 5 below).
+This holds for both MHA and GQA architectures.
 
 ## 3. FA-Era Selective AC: The New Practical Default
 
@@ -39,17 +43,22 @@ which eliminates `mlp_silu_output` (the SiLU output saved by the elementwise mul
 backward), while keeping the matmul outputs (gate_output, up_output) which are expensive
 to recompute.  See Bug Fix 6 below for the corrected modeling.
 
-**Simulator results:**
+**Simulator predictions and GPU measurements:**
 
-| Model                      | Memory Saved | Step Overhead |
-|----------------------------|-------------:|--------------:|
-| Llama-7B (A100, FSDP dp=8) |       -14.5% |        +0.00% |
-| Llama-13B (A100, FSDP dp=8)|       -14.5% |        +0.00% |
-| Llama-70B (H100, TP=8+dp=8)|       -18.2% |        +0.00% |
-| GPT-3 175B (A100, TP=8+PP=8)|      -11.6% |        +0.00% |
+| Model                      | Memory Saved | Step Overhead (sim) | Step Overhead (GPU) |
+|----------------------------|-------------:|--------------------:|--------------------:|
+| Llama-7B (H100, single GPU)|       -11.9% |              +0.00% |            **+0.9%** |
+| Qwen3-8B (H100, single GPU)|       -11.4% |              +0.00% |            **+1.1%** |
+| Llama-7B (A100, FSDP dp=8) |       -14.5% |              +0.00% |                  — |
+| Llama-13B (A100, FSDP dp=8)|       -14.5% |              +0.00% |                  — |
+| Llama-70B (H100, TP=8+dp=8)|       -18.2% |              +0.00% |                  — |
+| GPT-3 175B (A100, TP=8+PP=8)|      -11.6% |              +0.00% |                  — |
 
 This is a genuine free lunch: the recomputed operation (SiLU + elementwise multiply for
-SwiGLU) is so cheap relative to the surrounding matmuls that the overhead is immeasurable.
+SwiGLU) is so cheap relative to the surrounding matmuls that the measured overhead is <2%.
+The simulator predicts 0% because the recompute FLOPs are negligible; the measured ~1%
+comes from `torch.utils.checkpoint` bookkeeping (extra autograd nodes), not from the
+recomputed FLOPs themselves.
 
 This mirrors Korthikanti's principle exactly — **recompute the cheapest operation that frees
 the most memory** — but applied to the post-FA bottleneck.
@@ -297,7 +306,8 @@ This is a distinct tensor from `gate` because SiLU is non-linear.
 **Impact:** ~1.34 GiB underestimate for Llama-7B (s=2048, b=1). This was the single
 largest source of error in the GPU validation.
 
-*Not yet validated on GPU.*
+**Validated on GPU:** Confirmed via `saved_tensors_hooks` — exactly 4 ffn-sized (43 MiB)
+bf16 tensors per layer for Llama-7B, 4 × 48 MiB for Qwen3-8B.
 
 ### Fix 6: FA-Selective recomputes the wrong tensor (High severity)
 
@@ -317,7 +327,9 @@ FA-Selective.
 **Impact:** Combined with Fix 5, reduces No AC prediction error from -21.8% to -5.8% and
 FA-Selective from -24.4% to -6.3% (before rotary fix).
 
-*Not yet validated on GPU.*
+**Validated on GPU:** FA-Selective correctly eliminates `mlp_silu_output` while retaining
+`mlp_linear2_input`.  Measured savings (11.9% for Llama-7B, 11.4% for Qwen3-8B) match
+simulator predictions.
 
 ### Fix 7: Missing rotary position embedding tensors (Medium severity)
 
@@ -405,6 +417,54 @@ The main numerical change is that 1F1B step times are now 19-44% higher (due to 
 which makes the ZB schedule comparison genuine and strengthens the argument for considering
 pipeline schedules jointly with AC strategy.
 
+## 10. GPU Validation Observations
+
+### FA-Selective overhead is real but tiny
+
+The simulator predicts 0.0% compute overhead for FA-Selective (the recomputed SiLU is
+negligible relative to surrounding matmuls).  GPU measurements show:
+- Llama-7B: **+0.9%** overhead (190.3 ms → 192.0 ms fwd+bwd)
+- Qwen3-8B: **+1.1%** overhead (247.3 ms → 249.5 ms fwd+bwd)
+
+The small measured overhead likely comes from `torch.utils.checkpoint` bookkeeping (extra
+autograd nodes, re-execution of the checkpoint region), not from the recomputed FLOPs.
+This is still a "free lunch" for practical purposes — 1% overhead for 11-12% memory savings.
+
+### Full AC overhead is higher than predicted
+
+The simulator predicts ~24% compute overhead for Full AC (recomputing one full forward pass
+per layer).  GPU measurements show:
+- Llama-7B: **+28.6%** overhead
+- Qwen3-8B: **+48.5%** overhead (!)
+
+The discrepancy grows with GQA.  Possible causes: (1) `repeat_kv` is recomputed inside the
+checkpoint region (expanding K/V from 8→32 heads), adding work not modeled as "recompute";
+(2) QK-norm adds recompute cost; (3) kernel launch overhead from re-executing many small
+ops inside the checkpoint.  The Qwen3-8B case is striking — Full AC costs nearly 50% more
+compute, making the case for FA-Selective even stronger.
+
+### GQA amplifies MLP dominance
+
+With GQA (8 KV heads), attention activation memory drops dramatically:
+- Llama-7B (MHA): K=16 MiB, V=16 MiB per layer
+- Qwen3-8B (GQA): K=4 MiB, V=4 MiB per layer (4× smaller)
+
+But MLP activations are unchanged (or larger: ffn=12288 vs 11008).  For Qwen3-8B, the MLP
+block accounts for **~46%** of per-layer activation memory vs ~37% for attention.  This
+means FA-Selective (which targets MLP) is the right strategy regardless of whether the
+model uses MHA or GQA.
+
+### Full AC residual error (~8%) is from non-per-layer costs
+
+Both models show ~8% error for Full AC (predicting 0.50-0.56 GiB vs measured 0.55-0.61 GiB).
+The ~50-60 MiB gap is from tensors outside the per-layer model:
+- Final RMSNorm fp32 copy: 32 MiB
+- Embedding layer output: 16 MiB
+- RMSNorm rstd tensors and other small buffers
+
+This is not worth fixing — Full AC memory is so small (0.5-0.6 GiB) that the absolute
+error is negligible for any practical memory budget calculation.
+
 ---
 
 ## Paper Formulation
@@ -481,7 +541,8 @@ uniform Full AC.
 **Metrics:** Peak activation memory, training throughput (tokens/sec), recompute overhead (%),
 Pareto frontier of memory vs. throughput.
 
-**Models:** Llama-7B, Llama-13B, Llama-70B (FA-enabled, SwiGLU), GPT-3 175B (no FA, GELU).
+**Models:** Llama-7B, Llama-13B, Llama-70B (FA-enabled, SwiGLU, MHA/GQA), Qwen3-8B
+(FA + GQA + QK-norm), GPT-3 175B (no FA, GELU).
 
 **Hardware:** A100-40GB, A100-80GB, H100-80GB. Varying TP, PP, DP configurations.
 
@@ -490,35 +551,38 @@ pipeline-aware AC interacts with each.
 
 ### What Still Needs Validation (next steps)
 
-1. **Simulator validation on real hardware (DONE).** Initial H100 run showed -24.4% error.
-   Fixes 5-7 (SiLU output, FA-Selective semantics, rotary tensors) brought the error to
-   -1.5% (No AC) and +0.4% (FA-Selective). Confirmed via `saved_tensors_hooks` that autograd
-   retains exactly: 4 ffn-sized (43 MiB), 2 LN fp32 (32 MiB), 8 hidden-sized (16 MiB), and
-   1 FA logsumexp (0.25 MiB) per layer — matching the simulator's tensor list exactly.
-   Note: SDPA does NOT save its output O separately (disproved `attn_fa_output` hypothesis).
+1. **Simulator memory validation (DONE).** Validated on H100 with PyTorch 2.10 and
+   Transformers 5.5.4.  Two models tested:
+   - Llama-7B (MHA, SwiGLU, RoPE): **-1.5%** error (No AC), **-1.4%** (FA-Selective)
+   - Qwen3-8B (GQA, SwiGLU, RoPE, QK-norm): **-0.4%** error (No AC), **-0.5%** (FA-Selective)
+   Per-layer tensor counts confirmed via `saved_tensors_hooks`.
 
-2. **FA-Selective in practice.** Implement via `torch.utils.checkpoint` with a custom
-   `checkpoint_fn` that only wraps the activation function. Measure real overhead on 1 GPU.
-   Verify the ~0% overhead prediction — kernel launch overhead, memory allocator pressure,
-   and autograd bookkeeping could add a small constant.
+2. **FA-Selective compute overhead (DONE — single GPU).** Measured on H100:
+   - Llama-7B: +0.9% overhead for 11.9% memory savings
+   - Qwen3-8B: +1.1% overhead for 11.4% memory savings
+   Confirms the "free lunch" claim.  The small overhead is from checkpoint bookkeeping,
+   not from the recomputed FLOPs.
 
-3. **Pipeline-aware AC in Megatron-LM.** Modify `--recompute-granularity` to accept per-stage
-   configs. Run the Llama-7B PP=8 sweet-spot case on 8 GPUs and measure actual throughput.
-   The simulator predicts +24.6% vs. uniform Full AC — this needs experimental confirmation.
+3. **Pipeline-aware AC in Megatron-LM (TODO — requires 8 GPUs).** Modify
+   `--recompute-granularity` to accept per-stage configs.  Run the Llama-7B PP=8 sweet-spot
+   case and measure actual throughput.  The simulator predicts +24.6% vs. uniform Full AC.
 
-4. **Multi-schedule validation.** If possible, test with ZB-H1/H2 (available in the
-   zero-bubble codebase) to confirm the schedule-interaction predictions.
+4. **Multi-schedule validation (TODO — requires 8 GPUs).** Test with ZB-H1/H2 (available
+   in the zero-bubble codebase) to confirm the schedule-interaction predictions.
 
-### Current state of evidence (post bug-fix)
+### Current state of evidence
 
-| Claim | Status | Evidence | Survived Bug Fixes? |
-|-------|--------|----------|---------------------|
-| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 64 tests | Yes (structural) |
-| FA-Selective saves 12-18% at ~0% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| Pipeline-aware gives +24.6% in sweet spot | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| 1F1B has 19-44% bubble overhead vs ZB | Analytical ✓ | Post-fix comparison | NEW (was broken) |
-| Non-FA pipeline uses Korthikanti (~2.7%) | Analytical ✓ | Post-fix strategy search | NEW (was skipped) |
-| 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument | Yes (structural) |
-| ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| Memory formulas match GPU within 5% | **Validated ✓** | H100: Llama-7B -1.5%, Qwen3-8B -0.4% | Fixes 5-7 + QK-norm + GQA expansion |
+| Claim | Status | Evidence |
+|-------|--------|----------|
+| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 64 tests |
+| FA-Selective saves 11-12% at <2% overhead | **Validated ✓** | H100: Llama-7B 11.9% savings / +0.9% overhead, Qwen3-8B 11.4% / +1.1% |
+| Memory formulas match GPU within 2% | **Validated ✓** | H100: Llama-7B -1.5%, Qwen3-8B -0.4% (No AC and FA-Selective) |
+| Simulator generalizes across architectures | **Validated ✓** | MHA (Llama) and GQA+QK-norm (Qwen3) both <2% error |
+| Full AC overhead higher than modeled | **Observed** | Llama-7B: +28.6% (sim: +24%), Qwen3-8B: +48.5% (sim: +24%) |
+| GQA amplifies MLP dominance | **Observed** | Qwen3-8B: MLP = 46% of activation memory vs 37% for attention |
+| Pipeline-aware gives +24.6% in sweet spot | Analytical ✓ | Needs multi-GPU validation |
+| 1F1B has 19-44% bubble overhead vs ZB | Analytical ✓ | Post-fix comparison |
+| Non-FA pipeline uses Korthikanti (~2.7%) | Analytical ✓ | Post-fix strategy search |
+| 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation |
+| DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument |
+| ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation |
