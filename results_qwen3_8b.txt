@@ -1,0 +1,53 @@
+================================================================================
+  QWEN3-8B VALIDATION (GQA: 8 KV heads)
+  seq_len=2048, micro_batch_size=1, dtype=torch.bfloat16
+  hidden=4096, ffn=12288, layers=36
+================================================================================
+
+Simulator predictions (retained forward activations):
+  No AC          14.774 GB
+  FA-Selective   13.087 GB                                                                   Full AC        0.562 GB
+
+Creating Qwen3-8B decoder stack (random weights, torch.bfloat16)...
+  Decoder parameters: 7.57B
+
+================================================================================
+  PROFILING
+================================================================================
+
+--- No AC ---
+  Param memory:                14.161 GB
+  Retained activations:        14.849 GB
+  Retained activations (-out): 14.834 GB
+  Forward:                     93.1 ms
+  Backward:                    154.2 ms
+
+--- FA-Selective ---
+  Param memory:                14.161 GB
+  Retained activations:        13.162 GB
+  Retained activations (-out): 13.146 GB                                                     Forward:                     93.4 ms
+  Backward:                    156.1 ms
+--- Full AC ---
+  Param memory:                14.161 GB                                                     Retained activations:        0.626 GB
+  Retained activations (-out): 0.610 GB
+  Forward:                     78.5 ms                                                       Backward:                    214.5 ms
+
+================================================================================             COMPARISON: Simulator vs Measured
+================================================================================
+  Strategy              Sim Predicted   GPU Measured    Error
+  -------------------- -------------- -------------- --------
+  No AC                     14.774 GB      14.834 GB    -0.4%
+  FA-Selective              13.087 GB      13.146 GB    -0.5%
+  Full AC                    0.562 GB       0.610 GB    -7.8%
+
+  Memory savings vs No AC:
+  FA-Selective         11.4%
+  Full AC              95.9%
+
+================================================================================
+  VERDICT
+================================================================================
+  MARGINAL: Max error 7.8%
+  No AC                error=0.4%
+  FA-Selective         error=0.5%
+  Full AC              error=7.8%
