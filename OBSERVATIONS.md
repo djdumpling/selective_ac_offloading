@@ -340,6 +340,51 @@ PyTorch 2.10 — it either recomputes O in backward or shares the allocation wit
 `attn_out_proj_input`.  An earlier version of this fix included `attn_fa_output` as a
 separate tensor but this was disproved by the GPU measurement (+2.8% overshoot → removed).
 
+## 9. Qwen3-8B Validation: GQA and QK-Norm
+
+Extending validation from Llama-7B (MHA) to Qwen3-8B (GQA + QK-norm) revealed two
+architecture-specific features the simulator needed to model.
+
+### Per-layer tensor comparison (from `saved_tensors_hooks` on H100)
+
+| Size | Qwen3-8B (GQA) | Llama-7B (MHA) | What's different |
+|---|---|---|---|
+| 48 MiB × 4/layer | ffn activations | 43 MiB × 4 | Same count, larger ffn (12288 vs 11008) |
+| 32 MiB × 5/layer | 2 LN fp32 + 2 params + **1 Q QK-norm fp32** | 32 MiB × 6/layer | **+1 QK-norm** `(1, 2048, 32, 128)` fp32 |
+| 16 MiB × 7/layer | qkv_in, Q×2, **K_expanded**, **V_expanded**, o_proj, mlp_in | 16 MiB × 8/layer | GQA: K/V expanded 8→32 heads by `repeat_kv()` |
+| 8 MiB × 3/layer | 2 params (k/v_proj) + **1 K QK-norm fp32** | — | **NEW**: K norm fp32 `(1, 2048, 8, 128)` |
+| 4 MiB × 3/layer | K_pre, K_post, V_original | — | **NEW**: GQA small K/V (8 heads) |
+| 0.2 MiB × 2/layer | Q norm rstd + FA logsumexp | 0.25 MiB × 1 | **NEW**: QK-norm rstd |
+| 0.1 MiB × 1/layer | K norm rstd | — | **NEW**: QK-norm rstd |
+
+### Feature 1: QK-Norm (RMSNorm on Q and K)
+
+Qwen3 applies RMSNorm to Q and K after projection (`q_norm`, `k_norm`).  Each stores an
+fp32 copy for backward (same as LayerNorm):
+- Q norm: `[b, s, n_heads, head_dim]` fp32 = 32 MiB/layer
+- K norm: `[b, s, kv_heads, head_dim]` fp32 = 8 MiB/layer (GQA-sized)
+
+**Fix:** Added `use_qk_norm` config flag.  When active, adds `attn_q_norm_input` and
+`attn_k_norm_input` tensors.
+
+### Feature 2: GQA KV expansion (`repeat_kv`)
+
+With GQA (8 KV heads, 32 Q heads), HuggingFace calls `repeat_kv()` to expand K/V from
+`[b, 8, s, d_k]` → `[b, 32, s, d_k]` before SDPA.  SDPA saves the **expanded** versions
+(16 MiB each), while the original small K/V (4 MiB each) also persist.
+
+**Fix:** When `is_gqa` is True, adds `attn_k_expanded` and `attn_v_expanded` at full
+head count size.
+
+### Validation results
+
+| Strategy | Llama-7B (MHA) | | Qwen3-8B (GQA) | |
+|---|---|---|---|---|
+| | Predicted | Error | Predicted | Error |
+| No AC | 11.383 GiB | **-1.5%** | 14.774 GiB | **-0.4%** |
+| FA-Selective | 10.039 GiB | **-1.4%** | 13.087 GiB | **-0.4%** |
+| Full AC | 0.500 GiB | -8.8% | 0.562 GiB | -7.8% |
+
 ### Do the core claims still hold?
 
 **Yes.** Summary of impact on each claim:
@@ -353,7 +398,7 @@ separate tensor but this was disproved by the GPU measurement (+2.8% overshoot �
 | 3-Resource costs 1.6-3.2% | Unchanged — single-stage result |
 | DualPipe nullifies pipeline-aware | Unchanged — structural property |
 | Non-FA pipeline-aware | **Improved** — Korthikanti selective now available, reducing bottleneck overhead from ~20% to ~2.7% |
-| Memory formulas match GPU within 5% | **NEW** — Fixes 5-7 reduced validation error from -24.4% to -1.5% |
+| Memory formulas match GPU within 5% | **Validated** — Llama-7B: -1.5%, Qwen3-8B: -0.4% (H100, PyTorch 2.10) |
 
 The fixes made the simulator more accurate without invalidating any core contribution.
 The main numerical change is that 1F1B step times are now 19-44% higher (due to bubble),
@@ -476,4 +521,4 @@ pipeline-aware AC interacts with each.
 | 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
 | DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument | Yes (structural) |
 | ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| Memory formulas match GPU within 5% | **Validated ✓** | H100 run shows -1.5%/+0.4% | NEW (Fixes 5-7) |
+| Memory formulas match GPU within 5% | **Validated ✓** | H100: Llama-7B -1.5%, Qwen3-8B -0.4% | Fixes 5-7 + QK-norm + GQA expansion |

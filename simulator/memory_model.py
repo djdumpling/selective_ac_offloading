@@ -124,7 +124,35 @@ def get_attention_tensors(
         description="V projection output",
     ))
 
-    # ── 4b. Rotary position embedding intermediates ─────────────────────
+    # ── 4b. QK-Norm (Qwen3, etc.) ─────────────────────────────────────
+    # Some architectures apply RMSNorm to Q and K after projection.
+    # Each creates an fp32 copy of the input (like LayerNorm).
+    if cfg.use_qk_norm:
+        # Q norm fp32 copy: [b, s, n_heads, d_k] in fp32
+        q_norm_bytes = s * b * h * BYTES_FP32 / tp
+        tensors.append(TensorInfo(
+            name="attn_q_norm_input",
+            block="attention",
+            size_bytes=q_norm_bytes,
+            recompute_flops=5 * s * b * h / tp,
+            recompute_from=["attn_q"],
+            recomputable=True,
+            description="Q norm fp32 copy (RMSNorm on Q after projection)",
+        ))
+
+        # K norm fp32 copy: [b, s, kv_heads, d_k] in fp32 (GQA-aware)
+        k_norm_bytes = s * b * (h * kv_heads // a) * BYTES_FP32 / tp
+        tensors.append(TensorInfo(
+            name="attn_k_norm_input",
+            block="attention",
+            size_bytes=k_norm_bytes,
+            recompute_flops=5 * s * b * (h * kv_heads // a) / tp,
+            recompute_from=["attn_k"],
+            recomputable=True,
+            description="K norm fp32 copy (RMSNorm on K after projection)",
+        ))
+
+    # ── 4c. Rotary position embedding intermediates ─────────────────────
     # With RoPE, apply_rotary_pos_emb computes:
     #   q_embed = (q * cos) + (rotate_half(q) * sin)
     # SDPA saves the post-rotation q_embed, which is a DISTINCT tensor
@@ -148,7 +176,11 @@ def get_attention_tensors(
             description="Post-rotation Q (saved by SDPA, distinct from pre-rotation attn_q)",
         ))
 
-        # Post-rotation K (k_embed): GQA-aware shape, saved by SDPA
+        # Post-rotation K (k_embed): GQA-aware shape.
+        # With MHA this is saved by SDPA directly.  With GQA, repeat_kv()
+        # expands K to full head count before SDPA (see 4d below), and this
+        # small post-rotation K may or may not persist — we model it
+        # conservatively as retained.
         rotary_k_bytes = k_size
         tensors.append(TensorInfo(
             name="attn_rotary_k",
@@ -156,7 +188,31 @@ def get_attention_tensors(
             size_bytes=rotary_k_bytes,
             recompute_flops=3 * s * b * (h * kv_heads // a) / tp,
             recompute_from=["attn_k"],
-            description="Post-rotation K (saved by SDPA, distinct from pre-rotation attn_k)",
+            description="Post-rotation K (GQA-sized, before repeat_kv expansion)",
+        ))
+
+    # ── 4d. GQA KV expansion (repeat_kv) ────────────────────────────────
+    # With GQA, HuggingFace calls repeat_kv() to expand K/V from kv_heads
+    # to n_heads before passing to SDPA.  SDPA saves these EXPANDED tensors
+    # (full head count), which are much larger than the original K/V.
+    # The original small K/V also persist (saved by rotary / projection backward).
+    if cfg.is_gqa:
+        expanded_kv_bytes = s * b * h * bpe / tp  # full n_heads size
+        tensors.append(TensorInfo(
+            name="attn_k_expanded",
+            block="attention",
+            size_bytes=expanded_kv_bytes,
+            recompute_flops=0,  # repeat_kv is just expand+reshape, ~free
+            recompute_from=["attn_k"],
+            description="K expanded to full head count by repeat_kv (saved by SDPA)",
+        ))
+        tensors.append(TensorInfo(
+            name="attn_v_expanded",
+            block="attention",
+            size_bytes=expanded_kv_bytes,
+            recompute_flops=0,
+            recompute_from=["attn_v"],
+            description="V expanded to full head count by repeat_kv (saved by SDPA)",
         ))
 
     # ── 5–7. Quadratic attention tensors (ONLY without FlashAttention) ───

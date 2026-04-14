@@ -57,6 +57,7 @@ class ModelConfig:
     use_attn_dropout: bool = True             # Dropout after attention output proj
     use_mlp_dropout: bool = False             # Dropout after MLP (rare in modern models)
     use_rotary_embeddings: bool = False       # RoPE (Llama, etc.); creates extra Q/K intermediates
+    use_qk_norm: bool = False                 # RMSNorm on Q/K after projection (Qwen3, etc.)
     dtype_bytes: int = BYTES_BF16             # Bytes per activation element
 
     # MoE
@@ -260,6 +261,7 @@ def qwen3_8b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         activation_fn=ActivationFunction.SWIGLU,
         use_attn_dropout=False,
         use_rotary_embeddings=True,
+        use_qk_norm=True,
     )
 
 

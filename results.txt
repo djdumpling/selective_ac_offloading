@@ -1,54 +1,32 @@
-(.venv) root@spiritual-honored-kingfisher:~/selective_ac_offloading# python validate_on_gpu.py
-PyTorch 2.10.0+cu128, CUDA 12.8
-GPU: NVIDIA H100 80GB HBM3
-HBM: 79.2 GB
-Transformers 5.5.4
-flash-attn not installed — will use PyTorch SDPA (same FA kernel on H100)
-Using: SDPA (PyTorch built-in FlashAttention kernel)
 ================================================================================
   SIMULATOR VALIDATION: Llama-2-7B decoder activations on GPU
   seq_len=2048, micro_batch_size=1, dtype=torch.bfloat16
   simulator_gpu_profile=h100-sxm-80gb
 ================================================================================
-
 Simulator predictions (retained forward activations):
-  No AC                11.883 GB
-  FA-Selective         10.539 GB
-  Full AC              0.500 GB
+  No AC                11.383 GB
+  FA-Selective         10.039 GB                                                             Full AC              0.500 GB
 
 Creating Llama-2-7B decoder stack (random weights, torch.bfloat16)...
   Decoder parameters: 6.61B
-
+================================================================================             PROFILING
 ================================================================================
-  PROFILING
-================================================================================
-
---- No AC ---
-  Param memory:                12.370 GB
-  Retained activations:        11.572 GB
-  Retained activations (-out): 11.556 GB
-  Observed step peak:          12.338 GB
+--- No AC ---                                                                                Param memory:                12.370 GB
+  Retained activations:        11.572 GB                                                     Retained activations (-out): 11.556 GB
+  Observed step peak:          12.338 GB                                                     Total peak:                  24.708 GB
+  Forward:                     63.5 ms
+  Backward:                    125.8 ms
+                                                    --- FA-Selective ---
+  Param memory:                12.370 GB                                                     Retained activations:        10.197 GB                                                     Retained activations (-out): 10.181 GB                                                     Observed step peak:          12.338 GB
   Total peak:                  24.708 GB
-  Forward:                     63.7 ms
-  Backward:                    126.6 ms
+  Forward:                     63.8 ms                                                       Backward:                    127.2 ms
 
---- FA-Selective ---
-  Param memory:                12.370 GB
-  Retained activations:        10.197 GB
-  Retained activations (-out): 10.181 GB
-  Observed step peak:          12.338 GB
+                                                    --- Full AC ---
+  Param memory:                12.370 GB                                                     Retained activations:        0.563 GB
+  Retained activations (-out): 0.548 GB                                                      Observed step peak:          12.338 GB
   Total peak:                  24.708 GB
-  Forward:                     64.0 ms
-  Backward:                    128.0 ms
-
---- Full AC ---
-  Param memory:                12.370 GB
-  Retained activations:        0.563 GB
-  Retained activations (-out): 0.548 GB
-  Observed step peak:          12.338 GB
-  Total peak:                  24.708 GB
-  Forward:                     64.0 ms
-  Backward:                    180.3 ms
+  Forward:                     63.5 ms
+  Backward:                    179.8 ms
 
 ================================================================================
   COMPARISON: Simulator vs Measured
@@ -58,13 +36,13 @@ Creating Llama-2-7B decoder stack (random weights, torch.bfloat16)...
 
   Strategy              Sim Predicted   GPU Measured    Error
   -------------------- -------------- -------------- --------
-  No AC                     11.883 GB      11.556 GB    +2.8%
-  FA-Selective              10.539 GB      10.181 GB    +3.5%
+  No AC                     11.383 GB      11.556 GB    -1.5%
+  FA-Selective              10.039 GB      10.181 GB    -1.4%
   Full AC                    0.500 GB       0.548 GB    -8.7%
 
   Measured compute overhead vs No AC:
   FA-Selective         measured=+0.9% simulator=+0.0%
-  Full AC              measured=+28.4% simulator=+23.9%
+  Full AC              measured=+28.6% simulator=+23.9%
 
   Memory savings vs No AC:
   FA-Selective         11.9%
@@ -82,6 +60,6 @@ Creating Llama-2-7B decoder stack (random weights, torch.bfloat16)...
   VERDICT
 ================================================================================
   MARGINAL: Max error 8.7% — inspect the memory snapshot
-  No AC                error=2.8%
-  FA-Selective         error=3.5%
+  No AC                error=1.5%
+  FA-Selective         error=1.4%
   Full AC              error=8.7%

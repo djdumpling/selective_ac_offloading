@@ -54,6 +54,7 @@ SIM_CONFIG = ModelConfig(
     use_flash_attention=True,
     use_attn_dropout=False,
     use_rotary_embeddings=True,
+    use_qk_norm=True,
 )
 
 MODEL_OUTPUT_BYTES = SEQ_LEN * MICRO_BATCH_SIZE * hf_config.hidden_size * DTYPE_BYTES
