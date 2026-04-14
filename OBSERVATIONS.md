@@ -214,10 +214,10 @@ new opportunities.
 
 ## 8. Bug Fixes and Corrected Results
 
-Eight bugs were identified and fixed. Fixes 1-4 were found via adversarial review. Fixes
-5-8 were found via GPU validation (comparing simulator predictions against measured
-activation memory on an H100). The corrections changed some numerical results but
-**strengthened rather than weakened** the core claims.
+Seven bugs were identified and fixed. Fixes 1-4 were found via adversarial review. Fixes
+5-7 were found via GPU validation (comparing simulator predictions against measured
+activation memory on an H100 with PyTorch 2.10 and Transformers 5.5.4). The corrections
+changed some numerical results but **strengthened rather than weakened** the core claims.
 
 ### Fix 1: Bubble fraction now affects pipeline throughput (High severity)
 
@@ -319,32 +319,12 @@ FA-Selective from -24.4% to -6.3% (before rotary fix).
 
 *Not yet validated on GPU.*
 
-### Fix 7: Missing FlashAttention output tensor (Medium severity)
-
-**Bug:** SDPA with FlashAttention saves its output tensor `O` for backward (the FA kernel
-needs Q, K, V, and O to compute gradients). After SDPA, the HuggingFace Llama attention
-code does `.transpose(1, 2).contiguous()`, which creates a **separate** contiguous
-allocation that becomes the input to `o_proj`. Both the SDPA-saved `O` and the contiguous
-`o_proj` input are alive simultaneously. The simulator only modeled the latter.
-
-**Fix:** Added `attn_fa_output` tensor (size: `s × b × h × bpe / tp`, same as
-`attn_out_proj_input`) when FlashAttention is active.
-
-**Impact:** ~0.5 GiB underestimate for Llama-7B.
-
-*Not yet validated on GPU.*
-
-### Fix 8: Missing rotary position embedding tensors (Medium severity)
+### Fix 7: Missing rotary position embedding tensors (Medium severity)
 
 **Bug:** For models using RoPE (Llama family), `apply_rotary_pos_emb` produces a
 post-rotation Q and K that are saved by SDPA. These are distinct allocations from the
 pre-rotation Q and K (saved by the rotary backward), but the simulator modeled only one Q
 and one K tensor each.
-
-Additionally, the non-fused rotary implementation creates `rotate_half(Q/K)` intermediates
-via `torch.cat` that are retained by autograd. However, fused rotary kernels (available via
-`@use_kernel_func_from_hub` in HuggingFace Transformers) eliminate these intermediates.
-We model only the post-rotation copies.
 
 **Fix:** Added `use_rotary_embeddings` config flag (True for Llama, False for GPT-3). When
 active, adds `attn_rotary_q` and `attn_rotary_k` tensors.
@@ -352,9 +332,13 @@ active, adds `attn_rotary_q` and `attn_rotary_k` tensors.
 **Impact:** ~1.0 GiB underestimate for Llama-7B (MHA). For GQA models (Llama-70B with
 8 KV heads), the K rotary tensor is 8× smaller.
 
-*Not yet validated on GPU. The prediction now slightly overshoots (+2.8% for No AC),
-which may indicate the FA output tensor (Fix 7) is not a fully separate allocation in
-all PyTorch versions.*
+**Validated on GPU:** Using `torch.autograd.graph.saved_tensors_hooks`, we confirmed exactly
+8 hidden-sized (16 MiB) bf16 tensors per layer on an H100 with PyTorch 2.10 + Transformers
+5.5.4.  This matches the simulator's prediction (qkv_input, q, k, v, rotary_q, rotary_k,
+out_proj_input, mlp_input).  Note: SDPA does NOT save its output O as a separate tensor in
+PyTorch 2.10 — it either recomputes O in backward or shares the allocation with
+`attn_out_proj_input`.  An earlier version of this fix included `attn_fa_output` as a
+separate tensor but this was disproved by the GPU measurement (+2.8% overshoot → removed).
 
 ### Do the core claims still hold?
 
@@ -369,7 +353,7 @@ all PyTorch versions.*
 | 3-Resource costs 1.6-3.2% | Unchanged — single-stage result |
 | DualPipe nullifies pipeline-aware | Unchanged — structural property |
 | Non-FA pipeline-aware | **Improved** — Korthikanti selective now available, reducing bottleneck overhead from ~20% to ~2.7% |
-| Memory formulas match GPU within 5% | **NEW** — Fixes 5-8 reduced validation error from -24.4% to +3.5% |
+| Memory formulas match GPU within 5% | **NEW** — Fixes 5-7 reduced validation error from -24.4% to -1.5% |
 
 The fixes made the simulator more accurate without invalidating any core contribution.
 The main numerical change is that 1F1B step times are now 19-44% higher (due to bubble),
@@ -461,12 +445,12 @@ pipeline-aware AC interacts with each.
 
 ### What Still Needs Validation (next steps)
 
-1. **Simulator validation on real hardware (partially done).** Initial H100 run showed
-   -24.4% error. Fixes 5-8 (SiLU output, FA output, FA-Selective semantics, rotary tensors)
-   brought the predicted error to +2.8% (No AC) and +3.5% (FA-Selective) against the same
-   measurements. **Needs re-run** on GPU with the corrected simulator to confirm the new
-   predictions and investigate the slight overshoot (possibly from `attn_fa_output` not
-   being a fully separate allocation).
+1. **Simulator validation on real hardware (DONE).** Initial H100 run showed -24.4% error.
+   Fixes 5-7 (SiLU output, FA-Selective semantics, rotary tensors) brought the error to
+   -1.5% (No AC) and +0.4% (FA-Selective). Confirmed via `saved_tensors_hooks` that autograd
+   retains exactly: 4 ffn-sized (43 MiB), 2 LN fp32 (32 MiB), 8 hidden-sized (16 MiB), and
+   1 FA logsumexp (0.25 MiB) per layer — matching the simulator's tensor list exactly.
+   Note: SDPA does NOT save its output O separately (disproved `attn_fa_output` hypothesis).
 
 2. **FA-Selective in practice.** Implement via `torch.utils.checkpoint` with a custom
    `checkpoint_fn` that only wraps the activation function. Measure real overhead on 1 GPU.
@@ -492,4 +476,4 @@ pipeline-aware AC interacts with each.
 | 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
 | DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument | Yes (structural) |
 | ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
-| Memory formulas match GPU within 5% | Analytical ✓ | Partial: H100 run shows +2.8%/+3.5% | NEW (Fixes 5-8) |
+| Memory formulas match GPU within 5% | **Validated ✓** | H100 run shows -1.5%/+0.4% | NEW (Fixes 5-7) |

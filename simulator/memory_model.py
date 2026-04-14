@@ -10,11 +10,17 @@ Key reference formulas (no FA, no AC, bf16):
     LayerNorm (×2):    4·s·b·h              bytes
     Total per layer:  s·b·h·(35 + 5·a·s/h)  bytes
 
-With FlashAttention (MHA, bf16):
-    Attention block:  12·s·b·h  (no quadratic term; includes FA output)
+With FlashAttention (MHA, bf16, no RoPE):
+    Attention block:  10·s·b·h  (no quadratic term)
     MLP block (GeLU): 20·s·b·h  (includes activation output)
     LayerNorm (×2):    4·s·b·h
-    Total per layer:  ~36·s·b·h
+    Total per layer:  ~34·s·b·h
+
+With FlashAttention + RoPE (MHA, bf16):
+    Attention block:  14·s·b·h  (+ post-rotation Q/K copies)
+    MLP block (GeLU): 20·s·b·h
+    LayerNorm (×2):    4·s·b·h
+    Total per layer:  ~38·s·b·h
 """
 
 from __future__ import annotations
@@ -206,24 +212,13 @@ def get_attention_tensors(
             description="FlashAttention logsumexp statistics",
         ))
 
-        # ── 5b. FlashAttention output (saved by the FA backward kernel) ──
-        # SDPA/FA saves the output O for its backward pass.  After SDPA the
-        # output is transposed and made contiguous before entering o_proj,
-        # creating a SEPARATE allocation (attn_out_proj_input below).
-        # Shape: [b, a, s, d_k] = [s, b, h] total elements, divided by tp
-        fa_out_bytes = s * b * h * bpe / tp
-        tensors.append(TensorInfo(
-            name="attn_fa_output",
-            block="attention",
-            size_bytes=fa_out_bytes,
-            recompute_flops=0,  # Part of FA kernel; not independently recomputable
-            recompute_from=[],
-            recomputable=False,
-            description="FlashAttention output tensor (saved for FA backward)",
-        ))
+        # Note: SDPA in PyTorch 2.10+ does NOT save its output O as a
+        # separate tensor — it either recomputes O from Q,K,V in backward
+        # or shares the allocation with attn_out_proj_input.  Confirmed via
+        # saved_tensors_hooks: only 8 hidden-sized tensors per layer, not 9.
 
     # ── 8. Attention output projection input ─────────────────────────────
-    # Shape: [s, b, h], divided by tp — the contiguous reshape of FA output
+    # Shape: [s, b, h], divided by tp
     attn_out_proj_bytes = s * b * h * bpe / tp
     # Recompute = full attention (QK^T·V): 2·b·a·s²·d_k (for QK^T) + 2·b·a·s²·d_k (for ·V)
     attn_out_recompute = 4 * b * a * s * s * d_k / tp
