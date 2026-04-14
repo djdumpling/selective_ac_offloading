@@ -265,6 +265,126 @@ def qwen3_8b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
     )
 
 
+# ── Realistic large-model configs (verified from technical reports) ──────────
+
+def llama3_70b(seq_len: int = 8192, micro_batch_size: int = 1) -> ModelConfig:
+    """Llama-3.1-70B (Meta, 2024).
+
+    Source: HuggingFace config.json + arxiv 2407.21783.
+    Training: TP=8, PP=4, seq=8192 (extended to 128K), H100-80GB.
+    Architecture: 80 layers, GQA 8:1, SwiGLU, RoPE.
+    """
+    return ModelConfig(
+        name="llama3-70b",
+        num_layers=80,
+        hidden_dim=8192,
+        n_heads=64,
+        num_kv_heads=8,
+        ffn_dim=28672,
+        vocab_size=128256,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.SWIGLU,
+        use_flash_attention=True,
+        use_attn_dropout=False,
+        use_rotary_embeddings=True,
+    )
+
+
+def llama3_405b(seq_len: int = 8192, micro_batch_size: int = 1) -> ModelConfig:
+    """Llama-3.1-405B (Meta, 2024).
+
+    Source: HuggingFace config.json + arxiv 2407.21783.
+    Training: TP=8, PP=16, DP=128, seq=8192 (extended to 128K), 16384 H100s.
+    Architecture: 126 layers, GQA 16:1, SwiGLU, RoPE.
+    """
+    return ModelConfig(
+        name="llama3-405b",
+        num_layers=126,
+        hidden_dim=16384,
+        n_heads=128,
+        num_kv_heads=8,
+        ffn_dim=53248,
+        vocab_size=128256,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.SWIGLU,
+        use_flash_attention=True,
+        use_attn_dropout=False,
+        use_rotary_embeddings=True,
+    )
+
+
+def gpt_neox_20b(seq_len: int = 2048, micro_batch_size: int = 4) -> ModelConfig:
+    """GPT-NeoX-20B (EleutherAI, 2022).
+
+    Source: arxiv 2204.06745 + HuggingFace config.json.
+    Training: TP=2, PP=4, DP=12, mbs=4, 96 A100-40GB GPUs.
+    Architecture: 44 layers, MHA, GeLU, partial RoPE (25%).
+    Note: Predates FlashAttention.
+    """
+    return ModelConfig(
+        name="gpt-neox-20b",
+        num_layers=44,
+        hidden_dim=6144,
+        n_heads=64,
+        ffn_dim=24576,
+        vocab_size=50432,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=False,
+        use_rotary_embeddings=True,
+    )
+
+
+def bloom_176b(seq_len: int = 2048, micro_batch_size: int = 2) -> ModelConfig:
+    """BLOOM-176B (BigScience, 2022).
+
+    Source: arxiv 2211.05100 + HuggingFace config.json.
+    Training: TP=4, PP=12, DP=8, mbs=2, 384 A100-80GB GPUs.
+    Architecture: 70 layers, MHA, GeLU, ALiBi (not RoPE).
+    Note: Predates FlashAttention.
+    """
+    return ModelConfig(
+        name="bloom-176b",
+        num_layers=70,
+        hidden_dim=14336,
+        n_heads=112,
+        ffn_dim=57344,
+        vocab_size=250880,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=False,
+    )
+
+
+def falcon_180b(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
+    """Falcon-180B (TII, 2023).
+
+    Source: HuggingFace config.json.
+    Training: TP=8, PP=8, DP=64, 4096 A100-80GB GPUs.
+    Architecture: 80 layers, GQA 29:1 (8 KV heads), GeLU, RoPE.
+    Note: Uses parallel attention+MLP (GPT-J style), which our sequential
+    memory model approximates but doesn't perfectly capture.
+    """
+    return ModelConfig(
+        name="falcon-180b",
+        num_layers=80,
+        hidden_dim=14848,
+        n_heads=232,
+        num_kv_heads=8,
+        ffn_dim=59392,
+        vocab_size=65024,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.GELU,
+        use_flash_attention=True,  # Can use FA (GQA-compatible)
+        use_rotary_embeddings=True,
+    )
+
+
 def gpt3_175b(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
     return ModelConfig(
         name="gpt3-175b",
