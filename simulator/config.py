@@ -143,10 +143,14 @@ class TensorDecision:
     """Decision for a single activation tensor."""
     action: TensorAction
     compress_rank: Optional[int] = None       # Only used when action == COMPRESS
+    stored_size_bytes: Optional[float] = None # Override retained bytes when storage differs from tensor metadata
+    allow_nonrecomputable: bool = False       # For enclosing checkpoint regions that replay opaque ops
 
     def __post_init__(self):
         if self.action == TensorAction.COMPRESS:
             assert self.compress_rank is not None and self.compress_rank > 0
+        if self.stored_size_bytes is not None:
+            assert self.stored_size_bytes >= 0
 
 
 @dataclass
@@ -202,6 +206,7 @@ def llama_7b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         seq_len=seq_len,
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
+        use_attn_dropout=False,
     )
 
 
@@ -217,6 +222,7 @@ def llama_13b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         seq_len=seq_len,
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
+        use_attn_dropout=False,
     )
 
 
@@ -232,6 +238,7 @@ def llama_70b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         seq_len=seq_len,
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
+        use_attn_dropout=False,
     )
 
 

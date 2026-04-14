@@ -216,6 +216,14 @@ def _estimate_intra_block_liveness_gap(
     return layer_compute.fwd_total_latency_s + layer_compute.bwd_total_latency_s
 
 
+def _checkpoint_boundary_bytes(
+    cfg: ModelConfig,
+    par: ParallelismConfig,
+) -> float:
+    """Bytes retained per layer input under full-layer activation checkpointing."""
+    return cfg.seq_len * cfg.micro_batch_size * cfg.hidden_dim * cfg.dtype_bytes / par.sp_size
+
+
 # ── Main simulation ─────────────────────────────────────────────────────────
 
 def simulate(
@@ -282,24 +290,32 @@ def simulate(
             # Determine liveness gap for this tensor
             is_boundary = tensor.block in ("layernorm", "residual")
             gap = liveness_gap_boundary if is_boundary else liveness_gap_intra
+            stored_bytes = (
+                decision.stored_size_bytes
+                if decision.stored_size_bytes is not None
+                else tensor.size_bytes
+            )
 
             if decision.action == TensorAction.KEEP:
-                breakdown.kept_bytes += tensor.size_bytes
+                breakdown.kept_bytes += stored_bytes
                 breakdown.tensor_details[tensor.name] = "KEEP"
 
             elif decision.action == TensorAction.RECOMPUTE:
-                if not tensor.recomputable:
+                if not tensor.recomputable and not decision.allow_nonrecomputable:
                     raise ValueError(
                         f"Tensor {tensor.name} cannot be recomputed directly."
                     )
                 breakdown.recomputed_bytes += tensor.size_bytes
-                breakdown.recompute_flops += tensor.recompute_flops
-                total_recompute_flops += tensor.recompute_flops
-                breakdown.tensor_details[tensor.name] = "RECOMPUTE"
+                if tensor.recomputable:
+                    breakdown.recompute_flops += tensor.recompute_flops
+                    total_recompute_flops += tensor.recompute_flops
+                    breakdown.tensor_details[tensor.name] = "RECOMPUTE"
+                else:
+                    breakdown.tensor_details[tensor.name] = "RECOMPUTE (enclosing checkpoint)"
 
             elif decision.action == TensorAction.OFFLOAD_CPU:
                 result = compute_offload_result(tensor, gap, gpu, par)
-                breakdown.offloaded_bytes += tensor.size_bytes
+                breakdown.offloaded_bytes += stored_bytes
                 breakdown.offload_stall_s += result.stall_time_s
                 total_offload_stall += result.stall_time_s
                 breakdown.tensor_details[tensor.name] = (
@@ -407,17 +423,11 @@ def simulate_full_ac(
     par: ParallelismConfig = ParallelismConfig(),
     **kwargs,
 ) -> SimulatorResult:
-    """Simulate with full activation checkpointing (recompute everything)."""
+    """Simulate with full-layer activation checkpointing."""
     tensors = get_all_tensors_per_layer(cfg, par)
     strategies = []
     for i in range(cfg.num_layers):
-        decisions = {}
-        for t in tensors:
-            # Dropout masks can't be recomputed (need same RNG state)
-            if "dropout_mask" in t.name or "logsumexp" in t.name:
-                decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
-            else:
-                decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+        decisions = _build_full_ac_decisions(tensors, cfg, par)
         strategies.append(LayerStrategy(layer_idx=i, decisions=decisions))
     return simulate(cfg, gpu, strategies=strategies, par=par, **kwargs)
 
@@ -494,14 +504,27 @@ def _build_korthikanti_selective_decisions(
 
 def _build_full_ac_decisions(
     tensors: list[TensorInfo],
+    cfg: ModelConfig,
+    par: ParallelismConfig,
 ) -> dict[str, TensorDecision]:
-    """Full recomputation — minimum memory, maximum overhead."""
+    """Full-layer activation checkpointing.
+
+    This matches the common HF/PyTorch behavior: retain the layer input at the
+    checkpoint boundary and recompute the layer interior during backward.
+    """
+    checkpoint_bytes = _checkpoint_boundary_bytes(cfg, par)
     decisions = {}
     for t in tensors:
-        if not t.recomputable:
-            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+        if t.name == "ln1_input":
+            decisions[t.name] = TensorDecision(
+                action=TensorAction.KEEP,
+                stored_size_bytes=checkpoint_bytes,
+            )
         else:
-            decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
+            decisions[t.name] = TensorDecision(
+                action=TensorAction.RECOMPUTE,
+                allow_nonrecomputable=not t.recomputable,
+            )
     return decisions
 
 
@@ -549,12 +572,14 @@ def _stash_count_1f1b(stage_idx: int, pp_size: int) -> int:
     return max(0, pp_size - 1 - stage_idx)
 
 
-def _build_decisions(build_fn, tensors, cfg):
-    """Call a strategy builder, handling the cfg argument for FA-Selective."""
+def _build_decisions(build_fn, tensors, cfg, par):
+    """Call a strategy builder, passing through any required config arguments."""
     if build_fn == _build_fa_selective_decisions:
         return build_fn(tensors, cfg)
     if build_fn == _build_korthikanti_selective_decisions:
         return build_fn(tensors, cfg)
+    if build_fn == _build_full_ac_decisions:
+        return build_fn(tensors, cfg, par)
     return build_fn(tensors)
 
 
@@ -594,7 +619,7 @@ def _run_pipeline_simulation(
         build_fn = strategy_lookup[sname]
 
         start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
-        decisions = _build_decisions(build_fn, tensors, cfg)
+        decisions = _build_decisions(build_fn, tensors, cfg, par)
 
         strategies = [
             LayerStrategy(layer_idx=i, decisions=decisions)
@@ -704,7 +729,7 @@ def simulate_pipeline_aware_ac(
 
         for level_name, build_fn in STRATEGY_LEVELS:
             start, end = _stage_layer_span(cfg.num_layers, pp_size, stage_idx)
-            decisions = _build_decisions(build_fn, tensors, cfg)
+            decisions = _build_decisions(build_fn, tensors, cfg, par)
 
             strategies = [
                 LayerStrategy(layer_idx=i, decisions=decisions)

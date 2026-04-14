@@ -1,3 +1,7 @@
 # Python bytecode
 *.pyc
 __pycache__/
+.pytest_cache/
+
+# Local GPU validation artifacts
+memory_snapshot*.pickle

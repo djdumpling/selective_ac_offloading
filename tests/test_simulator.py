@@ -429,14 +429,14 @@ class TestSimulatorEnvironment:
         assert r_sel.recompute_overhead_pct == 0.0
 
     def test_invalid_recompute_raises(self):
-        """Strategies should reject impossible recomputations like RNG masks."""
+        """Strategies should reject impossible recomputations for opaque tensors."""
         cfg = llama_7b(seq_len=2048, micro_batch_size=1)
         gpu = A100_80GB
         strategies = [
             LayerStrategy(
                 layer_idx=i,
                 decisions={
-                    "attn_dropout_mask": TensorDecision(action=TensorAction.RECOMPUTE),
+                    "attn_fa_logsumexp": TensorDecision(action=TensorAction.RECOMPUTE),
                 },
             )
             for i in range(cfg.num_layers)
