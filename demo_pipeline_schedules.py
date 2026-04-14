@@ -80,7 +80,7 @@ def compare_schedules(name, cfg, gpu, par):
     print(f"\n  {'Schedule':<20} {'Stash':>10} {'Bubble':>7} {'Extra':>8}"
           f"  {'Uniform Full':>16} {'Uniform FA-Sel':>16} {'Pipeline-Aware':>16} {'Strategies'}")
     print(f"  {'':20} {'(first/last)':>10} {'':>7} {'Mem':>8}"
-          f"  {'Step(ms) Fit':>16} {'Step(ms) Fit':>16} {'Step(ms) Fit':>16}")
+          f"  {'ms/mb  Fit':>16} {'ms/mb  Fit':>16} {'ms/mb  Fit':>16}")
     print(f"  {'-'*20} {'-'*10} {'-'*7} {'-'*8}"
           f"  {'-'*16} {'-'*16} {'-'*16} {'-'*30}")
 

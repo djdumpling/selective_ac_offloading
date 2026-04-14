@@ -96,10 +96,10 @@ def search_sweet_spot(name, model_fn, gpu, pp_values, dp, seq_lens, mbs_values):
                 if is_differentiated and bottleneck_avoids_full:
                     found_any = True
                     print(f"\n  CONFIG: pp={pp}, seq={seq}, mbs={mbs}, dp={dp}")
-                    print(f"  Uniform Full AC: step={pr_uniform_full.overall_step_latency_s*1000:.1f}ms, "
+                    print(f"  Uniform Full AC: {pr_uniform_full.overall_step_latency_s*1000:.1f} ms/mb, "
                           f"overhead={pr_uniform_full.total_recompute_overhead_pct:.1f}%, "
                           f"fit={'YES' if pr_uniform_full.all_fit else 'NO'}")
-                    print(f"  Pipeline-Aware:  step={pr_aware.overall_step_latency_s*1000:.1f}ms, "
+                    print(f"  Pipeline-Aware:  {pr_aware.overall_step_latency_s*1000:.1f} ms/mb, "
                           f"overhead={pr_aware.total_recompute_overhead_pct:.1f}%, "
                           f"fit=YES")
                     print(f"  THROUGHPUT GAIN: {throughput_gain:+.1f}%")

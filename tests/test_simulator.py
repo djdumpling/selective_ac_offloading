@@ -20,6 +20,7 @@ from simulator.config import (
     llama_70b,
 )
 from simulator.memory_model import (
+    TensorInfo,
     get_all_tensors_per_layer,
     get_attention_tensors,
     get_mlp_tensors,
@@ -40,6 +41,7 @@ from simulator.offload_model import (
     can_overlap,
     effective_pcie_bandwidth,
     estimate_nccl_pcie_utilization,
+    schedule_offloads,
 )
 from simulator.compression_model import (
     compressed_size,
@@ -304,6 +306,23 @@ class TestOffloadModel:
         rt = round_trip_time(size, A100_80GB)
         ow = transfer_time(size, A100_80GB)
         assert abs(rt - 2 * ow) < 1e-12
+
+    def test_schedule_offloads_accounts_for_serialized_bus_occupancy(self):
+        """A later tensor should stall when an earlier transfer consumes the PCIe bus."""
+        size = 1024 ** 3  # 1 GiB
+        tensors = [
+            (TensorInfo("t1", "test", size, 0.0, []), 0.070),
+            (TensorInfo("t2", "test", size, 0.0, []), 0.070),
+        ]
+
+        results = schedule_offloads(tensors, A100_80GB, ParallelismConfig())
+
+        assert [r.tensor_name for r in results] == ["t1", "t2"]
+        assert results[0].stall_time_s == pytest.approx(0.0)
+
+        one_way = transfer_time(size, A100_80GB)
+        expected_second_stall = 2 * one_way
+        assert results[1].stall_time_s == pytest.approx(expected_second_stall)
 
 
 class TestCompressionModel:

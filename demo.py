@@ -248,7 +248,7 @@ if __name__ == "__main__":
         lat_aware = pr_aware.overall_step_latency_s
         speedup = (lat_uniform / lat_aware - 1.0) * 100 if lat_aware > 0 else 0
         print(f"\n  Pipeline-aware vs Uniform Full AC: "
-              f"step latency {speedup:+.2f}% "
+              f"per-microbatch latency {speedup:+.2f}% "
               f"({'faster' if speedup > 0 else 'same'})")
 
         all_uniform_fit = pr_uniform.all_fit

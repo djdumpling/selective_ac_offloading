@@ -171,20 +171,34 @@ def schedule_offloads(
     sorted_tensors = sorted(tensors, key=lambda x: x[1], reverse=True)
 
     results = []
+    # Track PCIe bus occupancy across all scheduled tensors.
+    # send_busy_until: earliest time the bus is free for a new send.
+    # recv_busy_until: earliest time the bus is free for a new recv.
+    # We model a half-duplex bus (send and recv share bandwidth).
     pcie_busy_until = 0.0
+
+    eff_bw = effective_pcie_bandwidth(gpu, par)
 
     for tensor, gap in sorted_tensors:
         send = transfer_time(tensor.size_bytes, gpu, par)
         recv = transfer_time(tensor.size_bytes, gpu, par)
 
+        # Send starts when bus is free (serialized with prior transfers)
         send_start = max(0.0, pcie_busy_until)
         send_end = send_start + send
-        pcie_busy_until = send_end
 
-        recv_start = gap - recv
-        stall = max(0.0, send_end - recv_start + recv - gap) if recv_start < send_end else 0.0
+        # Receive must complete by the deadline (= gap from tensor creation).
+        # Schedule it as late as possible: recv_end = gap, recv_start = gap - recv.
+        # But recv can't start until the bus is free after the send.
+        recv_start = max(send_end, gap - recv)
+        recv_end = recv_start + recv
 
-        eff_bw = effective_pcie_bandwidth(gpu, par)
+        # Update bus occupancy: next transfer can start after this recv finishes
+        pcie_busy_until = recv_end
+
+        # Stall = how much recv_end overshoots the deadline
+        stall = max(0.0, recv_end - gap)
+
         results.append(OffloadResult(
             tensor_name=tensor.name,
             size_bytes=tensor.size_bytes,
@@ -192,7 +206,7 @@ def schedule_offloads(
             recv_time_s=recv,
             round_trip_s=send + recv,
             memory_freed_bytes=tensor.size_bytes,
-            stall_time_s=max(0.0, (send + recv) - gap),
+            stall_time_s=stall,
             effective_bw_gb_s=eff_bw / (1024 ** 3),
         ))
 
