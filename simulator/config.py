@@ -246,6 +246,23 @@ def llama_70b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
     )
 
 
+def qwen3_8b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
+    return ModelConfig(
+        name="qwen3-8b",
+        num_layers=36,
+        hidden_dim=4096,
+        n_heads=32,
+        num_kv_heads=8,
+        ffn_dim=12288,
+        vocab_size=151936,
+        seq_len=seq_len,
+        micro_batch_size=micro_batch_size,
+        activation_fn=ActivationFunction.SWIGLU,
+        use_attn_dropout=False,
+        use_rotary_embeddings=True,
+    )
+
+
 def gpt3_175b(seq_len: int = 2048, micro_batch_size: int = 1) -> ModelConfig:
     return ModelConfig(
         name="gpt3-175b",
