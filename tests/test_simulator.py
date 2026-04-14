@@ -185,7 +185,7 @@ class TestPerTensorMemory:
             assert mem_fa < mem_no_fa, f"FA should use less memory at s={s}"
 
     def test_mlp_tensors_gelu(self):
-        """Standard GELU MLP should have: input, gelu_input, linear2_input."""
+        """Standard GELU MLP should have: input, gelu_input, gelu_output, linear2_input."""
         cfg = ModelConfig(
             name="test", num_layers=1, hidden_dim=4096,
             n_heads=32, vocab_size=32000, seq_len=2048,
@@ -195,15 +195,17 @@ class TestPerTensorMemory:
         names = [t.name for t in tensors]
         assert "mlp_input" in names
         assert "mlp_gelu_input" in names
+        assert "mlp_gelu_output" in names
         assert "mlp_linear2_input" in names
 
     def test_mlp_tensors_swiglu(self):
-        """SwiGLU MLP should have: input, gate_output, up_output, linear2_input."""
+        """SwiGLU MLP should have: input, gate_output, up_output, silu_output, linear2_input."""
         cfg = llama_7b()
         tensors = get_mlp_tensors(cfg)
         names = [t.name for t in tensors]
         assert "mlp_gate_output" in names
         assert "mlp_up_output" in names
+        assert "mlp_silu_output" in names
         assert "mlp_linear2_input" in names
         assert "mlp_gelu_input" not in names
 
@@ -616,7 +618,7 @@ class TestFAEraSelectiveAC:
     """Test the FA-era selective recompute strategy."""
 
     def test_saves_memory_vs_no_ac(self):
-        """FA-era selective should save memory by recomputing mlp_linear2_input."""
+        """FA-era selective should save memory by recomputing the activation output."""
         cfg = llama_7b(seq_len=4096, micro_batch_size=2)
         gpu = A100_80GB
         par = ParallelismConfig(dp_size=8)
@@ -651,15 +653,15 @@ class TestFAEraSelectiveAC:
             f"FA-era selective overhead should be tiny, got {r.recompute_overhead_pct:.2f}%"
         )
 
-    def test_only_recomputes_linear2_input(self):
-        """Should only recompute mlp_linear2_input, nothing else."""
+    def test_only_recomputes_activation_output(self):
+        """Should only recompute the activation output (mlp_silu_output), nothing else."""
         cfg = llama_7b(seq_len=2048, micro_batch_size=1)
         gpu = A100_80GB
 
         r = simulate_fa_selective_ac(cfg, gpu)
         layer0 = r.per_layer[0]
         for tname, action in layer0.tensor_details.items():
-            if tname == "mlp_linear2_input":
+            if tname == "mlp_silu_output":
                 assert action == "RECOMPUTE"
             else:
                 assert action == "KEEP", f"{tname} should be KEEP, got {action}"

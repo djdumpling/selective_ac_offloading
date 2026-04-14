@@ -6,14 +6,15 @@ is active the quadratic attention tensors are never materialized.
 
 Key reference formulas (no FA, no AC, bf16):
     Attention block:  11·s·b·h + 5·a·s²·b  bytes
-    MLP block:        19·s·b·h              bytes
+    MLP block (GeLU): 20·s·b·h             bytes  (includes activation output)
     LayerNorm (×2):    4·s·b·h              bytes
-    Total per layer:  s·b·h·(34 + 5·a·s/h)  bytes
+    Total per layer:  s·b·h·(35 + 5·a·s/h)  bytes
 
-With FlashAttention:
-    Attention block:   9·s·b·h  (no quadratic term)
-    MLP block:        19·s·b·h  (unchanged)
-    Total per layer:  ~32·s·b·h
+With FlashAttention (MHA, bf16):
+    Attention block:  12·s·b·h  (no quadratic term; includes FA output)
+    MLP block (GeLU): 20·s·b·h  (includes activation output)
+    LayerNorm (×2):    4·s·b·h
+    Total per layer:  ~36·s·b·h
 """
 
 from __future__ import annotations
@@ -117,6 +118,41 @@ def get_attention_tensors(
         description="V projection output",
     ))
 
+    # ── 4b. Rotary position embedding intermediates ─────────────────────
+    # With RoPE, apply_rotary_pos_emb computes:
+    #   q_embed = (q * cos) + (rotate_half(q) * sin)
+    # SDPA saves the post-rotation q_embed, which is a DISTINCT tensor
+    # from the pre-rotation Q (attn_q, saved by the rotary backward).
+    # V is not rotated.
+    #
+    # Without a fused kernel, rotate_half() also creates intermediates
+    # via torch.cat.  Fused rotary kernels (flash-attn, transformers
+    # @use_kernel_func_from_hub) typically eliminate those, so we model
+    # only the post-rotation copies here.
+    if cfg.use_rotary_embeddings:
+        # Post-rotation Q (q_embed): [b, a, s, d_k] — saved by SDPA,
+        # distinct from pre-rotation attn_q saved by rotary backward
+        rotary_q_bytes = q_bytes  # s * b * h * bpe / tp
+        tensors.append(TensorInfo(
+            name="attn_rotary_q",
+            block="attention",
+            size_bytes=rotary_q_bytes,
+            recompute_flops=3 * s * b * h / tp,  # cheap: 2 muls + 1 add
+            recompute_from=["attn_q"],
+            description="Post-rotation Q (saved by SDPA, distinct from pre-rotation attn_q)",
+        ))
+
+        # Post-rotation K (k_embed): GQA-aware shape, saved by SDPA
+        rotary_k_bytes = k_size
+        tensors.append(TensorInfo(
+            name="attn_rotary_k",
+            block="attention",
+            size_bytes=rotary_k_bytes,
+            recompute_flops=3 * s * b * (h * kv_heads // a) / tp,
+            recompute_from=["attn_k"],
+            description="Post-rotation K (saved by SDPA, distinct from pre-rotation attn_k)",
+        ))
+
     # ── 5–7. Quadratic attention tensors (ONLY without FlashAttention) ───
     if not cfg.use_flash_attention:
         # Softmax output: [b, a, s, s], divided by tp
@@ -170,8 +206,24 @@ def get_attention_tensors(
             description="FlashAttention logsumexp statistics",
         ))
 
+        # ── 5b. FlashAttention output (saved by the FA backward kernel) ──
+        # SDPA/FA saves the output O for its backward pass.  After SDPA the
+        # output is transposed and made contiguous before entering o_proj,
+        # creating a SEPARATE allocation (attn_out_proj_input below).
+        # Shape: [b, a, s, d_k] = [s, b, h] total elements, divided by tp
+        fa_out_bytes = s * b * h * bpe / tp
+        tensors.append(TensorInfo(
+            name="attn_fa_output",
+            block="attention",
+            size_bytes=fa_out_bytes,
+            recompute_flops=0,  # Part of FA kernel; not independently recomputable
+            recompute_from=[],
+            recomputable=False,
+            description="FlashAttention output tensor (saved for FA backward)",
+        ))
+
     # ── 8. Attention output projection input ─────────────────────────────
-    # Shape: [s, b, h], divided by tp
+    # Shape: [s, b, h], divided by tp — the contiguous reshape of FA output
     attn_out_proj_bytes = s * b * h * bpe / tp
     # Recompute = full attention (QK^T·V): 2·b·a·s²·d_k (for QK^T) + 2·b·a·s²·d_k (for ·V)
     attn_out_recompute = 4 * b * a * s * s * d_k / tp
@@ -181,7 +233,7 @@ def get_attention_tensors(
         size_bytes=attn_out_proj_bytes,
         recompute_flops=attn_out_recompute,
         recompute_from=["attn_q", "attn_k", "attn_v"],
-        description="Input to attention output projection",
+        description="Input to attention output projection (contiguous reshape of FA output)",
     ))
 
     # ── 9. Attention output dropout mask ─────────────────────────────────
@@ -261,11 +313,42 @@ def get_mlp_tensors(
             description="Input to GeLU activation (first linear output)",
         ))
 
+    # ── 2b. Activation function output ──────────────────────────────────
+    # The elementwise multiply (SwiGLU: silu(gate)*up) or the pointwise
+    # activation (GeLU) saves its output.  For the multiply backward,
+    # both operands (silu(gate) AND up) must be retained — silu(gate) is
+    # distinct from the gate projection output because SiLU is non-linear.
+    # For GeLU, the activation output is saved by the second linear's
+    # backward (which needs it as its input).
+    activation_out_bytes = s * b * ffn * bpe / tp
+    if cfg.is_swiglu:
+        # silu(gate): cheap pointwise activation
+        silu_recompute = s * b * ffn / tp  # silu FLOPs
+        tensors.append(TensorInfo(
+            name="mlp_silu_output",
+            block="mlp",
+            size_bytes=activation_out_bytes,
+            recompute_flops=silu_recompute,
+            recompute_from=["mlp_gate_output"],
+            description="SiLU activation output (saved by elementwise multiply backward)",
+        ))
+    else:
+        # GeLU output: saved by second linear backward
+        gelu_out_recompute = 8 * s * b * ffn / tp  # GeLU approximation
+        tensors.append(TensorInfo(
+            name="mlp_gelu_output",
+            block="mlp",
+            size_bytes=activation_out_bytes,
+            recompute_flops=gelu_out_recompute,
+            recompute_from=["mlp_gelu_input"],
+            description="GeLU activation output (saved by second linear backward)",
+        ))
+
     # ── 3. Second linear input (GeLU/SwiGLU output) ─────────────────────
     linear2_input_bytes = s * b * ffn * bpe / tp
     # Recomputing this requires rerunning first linear + activation
     if cfg.is_swiglu:
-        # silu(gate) * up: need gate_output + up_output
+        # silu(gate) * up: need silu_output + up_output
         linear2_recompute = 2 * s * b * ffn / tp  # silu + elementwise mul
         recompute_from = ["mlp_gate_output", "mlp_up_output"]
     else:

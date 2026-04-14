@@ -22,21 +22,22 @@ for the FA era.
 With FA eliminating the attention quadratic term, per-layer activation memory becomes:
 
 ```
-Attention (with FA):  ~9 sbh / tp    (Q, K, V, output proj input, FA logsumexp)
-MLP (SwiGLU):         ~3 × ffn × sb × bpe / tp + sbh × bpe / sp   (gate, up, linear2, input)
-LayerNorm:            2 × sbh × 4 / sp   (fp32 inputs)
+Attention (with FA+RoPE): ~14 sbh / tp   (Q, K, V, rotary Q/K, FA output, o_proj input, FA logsumexp)
+MLP (SwiGLU):              ~4 × ffn × sb × bpe / tp + sbh × bpe / sp  (gate, up, silu_out, linear2, input)
+LayerNorm:                 2 × sbh × 4 / sp   (fp32 inputs)
 ```
 
-For Llama-7B (h=4096, ffn=11008, tp=1): attention is ~9 × 4096 × 2 = 72K elements per
-token, MLP is ~3 × 11008 × 2 = 66K elements per token. They're roughly equal, but the MLP
-tensors are the ones amenable to cheap recomputation — specifically `mlp_linear2_input`,
-which is the output of a pointwise activation function (SiLU for SwiGLU, GeLU for standard).
+For Llama-7B (h=4096, ffn=11008, tp=1): attention is ~14 × 4096 × 2 = 112K elements per
+token, MLP is ~4 × 11008 × 2 + 4096 × 2 = 96K elements per token. The MLP block is still
+the primary target for cheap recomputation — specifically `mlp_silu_output`, the SiLU
+activation output saved by the elementwise multiply backward (see Bug Fix 5 below).
 
 ## 3. FA-Era Selective AC: The New Practical Default
 
-The FA-era analogue of Korthikanti's strategy: recompute `mlp_linear2_input` (the activation
-function output), which is a cheap pointwise operation, while keeping the matmul outputs
-(gate_output, up_output) which are expensive to recompute.
+The FA-era analogue of Korthikanti's strategy: checkpoint the pointwise activation function,
+which eliminates `mlp_silu_output` (the SiLU output saved by the elementwise multiply
+backward), while keeping the matmul outputs (gate_output, up_output) which are expensive
+to recompute.  See Bug Fix 6 below for the corrected modeling.
 
 **Simulator results:**
 
@@ -213,8 +214,10 @@ new opportunities.
 
 ## 8. Bug Fixes and Corrected Results
 
-Four bugs were identified (via adversarial review) and fixed. The corrections changed
-some numerical results but **strengthened rather than weakened** the core claims.
+Eight bugs were identified and fixed. Fixes 1-4 were found via adversarial review. Fixes
+5-8 were found via GPU validation (comparing simulator predictions against measured
+activation memory on an H100). The corrections changed some numerical results but
+**strengthened rather than weakened** the core claims.
 
 ### Fix 1: Bubble fraction now affects pipeline throughput (High severity)
 
@@ -280,6 +283,79 @@ uniformly. Stages with fewer layers (uneven PP division) were overcharged.
 **Impact:** Small — only affects uneven PP divisions (e.g., 32 layers / 3 stages). The
 last stage now correctly gets less deferred-W overhead.
 
+### Fix 5: Missing SiLU activation output tensor (High severity)
+
+**Bug:** The MLP memory model accounted for four tensors per SwiGLU layer: `mlp_input`,
+`mlp_gate_output`, `mlp_up_output`, and `mlp_linear2_input`. But PyTorch's autograd also
+retains the SiLU activation output — the elementwise multiply `silu(gate) * up` saves
+**both** its operands for backward: `up` (already modeled) and `silu(gate)` (missing).
+This is a distinct tensor from `gate` because SiLU is non-linear.
+
+**Fix:** Added `mlp_silu_output` (size: `s × b × ffn × bpe / tp`) and its GeLU equivalent
+`mlp_gelu_output` to the MLP memory model.
+
+**Impact:** ~1.34 GiB underestimate for Llama-7B (s=2048, b=1). This was the single
+largest source of error in the GPU validation.
+
+*Not yet validated on GPU.*
+
+### Fix 6: FA-Selective recomputes the wrong tensor (High severity)
+
+**Bug:** The FA-Selective strategy was modeled as recomputing `mlp_linear2_input` (=
+`silu(gate) * up`). But in the real `torch.utils.checkpoint` implementation, the
+checkpoint wraps the pointwise activation (`_silu_mul`), so what gets eliminated is the
+**intermediate** `silu(gate)` inside the checkpoint — NOT `mlp_linear2_input`, which exits
+the checkpoint and is saved by `down_proj`'s backward.
+
+The old model got the **savings** right by coincidence (`silu(gate)` and `linear2_input`
+are the same size), but the absolute memory levels were wrong for both No AC and
+FA-Selective.
+
+**Fix:** FA-Selective now recomputes `mlp_silu_output` / `mlp_gelu_output` instead of
+`mlp_linear2_input`.
+
+**Impact:** Combined with Fix 5, reduces No AC prediction error from -21.8% to -5.8% and
+FA-Selective from -24.4% to -6.3% (before rotary fix).
+
+*Not yet validated on GPU.*
+
+### Fix 7: Missing FlashAttention output tensor (Medium severity)
+
+**Bug:** SDPA with FlashAttention saves its output tensor `O` for backward (the FA kernel
+needs Q, K, V, and O to compute gradients). After SDPA, the HuggingFace Llama attention
+code does `.transpose(1, 2).contiguous()`, which creates a **separate** contiguous
+allocation that becomes the input to `o_proj`. Both the SDPA-saved `O` and the contiguous
+`o_proj` input are alive simultaneously. The simulator only modeled the latter.
+
+**Fix:** Added `attn_fa_output` tensor (size: `s × b × h × bpe / tp`, same as
+`attn_out_proj_input`) when FlashAttention is active.
+
+**Impact:** ~0.5 GiB underestimate for Llama-7B.
+
+*Not yet validated on GPU.*
+
+### Fix 8: Missing rotary position embedding tensors (Medium severity)
+
+**Bug:** For models using RoPE (Llama family), `apply_rotary_pos_emb` produces a
+post-rotation Q and K that are saved by SDPA. These are distinct allocations from the
+pre-rotation Q and K (saved by the rotary backward), but the simulator modeled only one Q
+and one K tensor each.
+
+Additionally, the non-fused rotary implementation creates `rotate_half(Q/K)` intermediates
+via `torch.cat` that are retained by autograd. However, fused rotary kernels (available via
+`@use_kernel_func_from_hub` in HuggingFace Transformers) eliminate these intermediates.
+We model only the post-rotation copies.
+
+**Fix:** Added `use_rotary_embeddings` config flag (True for Llama, False for GPT-3). When
+active, adds `attn_rotary_q` and `attn_rotary_k` tensors.
+
+**Impact:** ~1.0 GiB underestimate for Llama-7B (MHA). For GQA models (Llama-70B with
+8 KV heads), the K rotary tensor is 8× smaller.
+
+*Not yet validated on GPU. The prediction now slightly overshoots (+2.8% for No AC),
+which may indicate the FA output tensor (Fix 7) is not a fully separate allocation in
+all PyTorch versions.*
+
 ### Do the core claims still hold?
 
 **Yes.** Summary of impact on each claim:
@@ -293,6 +369,7 @@ last stage now correctly gets less deferred-W overhead.
 | 3-Resource costs 1.6-3.2% | Unchanged — single-stage result |
 | DualPipe nullifies pipeline-aware | Unchanged — structural property |
 | Non-FA pipeline-aware | **Improved** — Korthikanti selective now available, reducing bottleneck overhead from ~20% to ~2.7% |
+| Memory formulas match GPU within 5% | **NEW** — Fixes 5-8 reduced validation error from -24.4% to +3.5% |
 
 The fixes made the simulator more accurate without invalidating any core contribution.
 The main numerical change is that 1F1B step times are now 19-44% higher (due to bubble),
@@ -340,8 +417,8 @@ non-uniform checkpointing.
    amplified by ZB-H2's deferred-W overhead, and nullified by DualPipe's symmetric stash.
 
 5. **(System)** Analytical simulator with per-tensor granularity, realistic compression
-   compute cost, PCIe contention modeling, and multi-schedule pipeline support. 63 tests
-   validated against Korthikanti formulas.
+   compute cost, PCIe contention modeling, and multi-schedule pipeline support. 64 tests
+   validated against Korthikanti formulas and GPU measurements.
 
 ### Optional Extension (if time permits)
 
@@ -384,10 +461,12 @@ pipeline-aware AC interacts with each.
 
 ### What Still Needs Validation (next steps)
 
-1. **Simulator validation on real hardware (highest priority).** Run Llama-7B training step
-   on a single A100, dump memory snapshot via `torch.cuda.memory._dump_snapshot()`, compare
-   to simulator prediction. Target <5% error on peak memory. This confirms the memory
-   formulas are correct.
+1. **Simulator validation on real hardware (partially done).** Initial H100 run showed
+   -24.4% error. Fixes 5-8 (SiLU output, FA output, FA-Selective semantics, rotary tensors)
+   brought the predicted error to +2.8% (No AC) and +3.5% (FA-Selective) against the same
+   measurements. **Needs re-run** on GPU with the corrected simulator to confirm the new
+   predictions and investigate the slight overshoot (possibly from `attn_fa_output` not
+   being a fully separate allocation).
 
 2. **FA-Selective in practice.** Implement via `torch.utils.checkpoint` with a custom
    `checkpoint_fn` that only wraps the activation function. Measure real overhead on 1 GPU.
@@ -405,7 +484,7 @@ pipeline-aware AC interacts with each.
 
 | Claim | Status | Evidence | Survived Bug Fixes? |
 |-------|--------|----------|---------------------|
-| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 63 tests | Yes (structural) |
+| Korthikanti selective = no-op with FA | Analytical ✓ | Simulator, 64 tests | Yes (structural) |
 | FA-Selective saves 12-18% at ~0% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
 | Pipeline-aware gives +24.6% in sweet spot | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
 | 1F1B has 19-44% bubble overhead vs ZB | Analytical ✓ | Post-fix comparison | NEW (was broken) |
@@ -413,3 +492,4 @@ pipeline-aware AC interacts with each.
 | 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
 | DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument | Yes (structural) |
 | ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation | Yes (unchanged) |
+| Memory formulas match GPU within 5% | Analytical ✓ | Partial: H100 run shows +2.8%/+3.5% | NEW (Fixes 5-8) |

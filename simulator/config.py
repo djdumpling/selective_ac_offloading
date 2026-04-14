@@ -56,6 +56,7 @@ class ModelConfig:
     use_softmax_dropout: bool = False         # Dropout after softmax (rare in modern models)
     use_attn_dropout: bool = True             # Dropout after attention output proj
     use_mlp_dropout: bool = False             # Dropout after MLP (rare in modern models)
+    use_rotary_embeddings: bool = False       # RoPE (Llama, etc.); creates extra Q/K intermediates
     dtype_bytes: int = BYTES_BF16             # Bytes per activation element
 
     # MoE
@@ -207,6 +208,7 @@ def llama_7b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
         use_attn_dropout=False,
+        use_rotary_embeddings=True,
     )
 
 
@@ -223,6 +225,7 @@ def llama_13b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
         use_attn_dropout=False,
+        use_rotary_embeddings=True,
     )
 
 
@@ -239,6 +242,7 @@ def llama_70b(seq_len: int = 4096, micro_batch_size: int = 1) -> ModelConfig:
         micro_batch_size=micro_batch_size,
         activation_fn=ActivationFunction.SWIGLU,
         use_attn_dropout=False,
+        use_rotary_embeddings=True,
     )
 
 

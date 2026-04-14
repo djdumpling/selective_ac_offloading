@@ -472,10 +472,18 @@ def _build_fa_selective_decisions(
     tensors: list[TensorInfo],
     cfg: ModelConfig,
 ) -> dict[str, TensorDecision]:
-    """FA-era selective: recompute mlp_linear2_input only."""
+    """FA-era selective: recompute the activation function output only.
+
+    The checkpoint wraps the pointwise activation (SiLU or GeLU), so the
+    intermediate activation output (mlp_silu_output / mlp_gelu_output) is
+    eliminated.  The second-linear input (mlp_linear2_input) is still
+    retained because it exits the checkpoint region and is saved by
+    down_proj's backward.
+    """
+    recompute_names = {"mlp_silu_output", "mlp_gelu_output"}
     decisions = {}
     for t in tensors:
-        if t.name == "mlp_linear2_input":
+        if t.name in recompute_names:
             decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
         else:
             decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
@@ -850,23 +858,26 @@ def simulate_fa_selective_ac(
     - Keeps all attention tensors (FA handles them)
     - Keeps MLP matmul outputs (gate_output, up_output, gelu_input)
       because they're expensive to recompute (full matmul)
-    - Recomputes mlp_linear2_input: this is GeLU(gelu_input) or
-      SiLU(gate)*up, which is a cheap pointwise op
+    - Recomputes the activation function output (mlp_silu_output or
+      mlp_gelu_output): the cheap pointwise op wrapped in a checkpoint
 
-    The principle is identical to Korthikanti: recompute the cheapest
-    operation that frees the most memory.
+    The checkpoint wraps the pointwise activation, so the intermediate
+    (silu(gate) for SwiGLU, gelu(x) for GeLU) is not saved.  The
+    second-linear input (mlp_linear2_input = silu(gate)*up or gelu(x))
+    still exits the checkpoint and is saved by down_proj's backward.
 
-    For GELU MLP:  saves 8sbh/tp per layer (mlp_linear2_input)
+    For GELU MLP:  saves ffn*sb*bpe/tp per layer (mlp_gelu_output)
                    at cost of GeLU recompute (~8 FLOPs per element)
-    For SwiGLU MLP: saves ffn*sb*bpe/tp per layer (mlp_linear2_input)
-                    at cost of SiLU + elementwise mul
+    For SwiGLU MLP: saves ffn*sb*bpe/tp per layer (mlp_silu_output)
+                    at cost of SiLU recompute
     """
     tensors = get_all_tensors_per_layer(cfg, par)
+    recompute_names = {"mlp_silu_output", "mlp_gelu_output"}
     strategies = []
     for i in range(cfg.num_layers):
         decisions = {}
         for t in tensors:
-            if t.name == "mlp_linear2_input":
+            if t.name in recompute_names:
                 decisions[t.name] = TensorDecision(action=TensorAction.RECOMPUTE)
             else:
                 decisions[t.name] = TensorDecision(action=TensorAction.KEEP)

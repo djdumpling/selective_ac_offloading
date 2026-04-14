@@ -132,6 +132,7 @@ SIM_CONFIG = ModelConfig(
     activation_fn=ActivationFunction.SWIGLU,
     use_flash_attention=True,
     use_attn_dropout=False,
+    use_rotary_embeddings=True,
 )
 
 MODEL_OUTPUT_BYTES = SEQ_LEN * MICRO_BATCH_SIZE * LLAMA_CONFIG.hidden_size * DTYPE_BYTES
