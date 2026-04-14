@@ -636,6 +636,32 @@ The original Llama-7B PP=8 result was a proof of concept in an artificial config
 realistic sweet spot is **large models (70B+) with moderate PP (4-8) at standard training
 seq_lens (4K-16K)**. These are configs practitioners actually use.
 
+### GPU validation: the scale problem
+
+The realistic configs where the sweet spot appears (Llama-3 70B TP=8 PP=4, BLOOM-176B
+TP=4 PP=12) require 32-384 GPUs. On 8 H100s (single node), the only models that hit the
+sweet spot are small models with artificially high PP:
+
+| 8-GPU config | Sweet spot? | Realistic? |
+|---|---|---|
+| Qwen3-8B TP=2 PP=4 | Yes (+23-27%) | **No** — 8B model doesn't need PP=4 |
+| GPT-NeoX-20B TP=2 PP=4 | Yes (+20%) | **Marginal** — 20B can use PP but TP=2 PP=4 is unusual |
+| Llama-7B TP=1 PP=8 | No (No AC fits) | No |
+| Llama-13B TP=2 PP=4 | No (No AC fits or Full AC bottleneck) | No |
+| Llama-3 70B TP=4 PP=2 | No (OOM everywhere) | N/A — doesn't fit |
+
+**The 8-GPU validation strategy** is to use Qwen3-8B TP=2 PP=4 as a **simulator accuracy
+test**, not a production-worthy demo:
+1. Validate that the simulator's pipeline memory predictions are correct (stash model, per-stage peaks)
+2. Validate that the throughput gain from pipeline-aware AC matches the prediction (~23%)
+3. Use simulator accuracy on 8 GPUs to argue credibility of predictions at 32+ GPUs
+
+This is a standard systems paper approach (validate model on available hardware, extrapolate
+to larger scale), but reviewers may push back on lacking an end-to-end result at realistic
+scale. **32 H100s (4 nodes × 8 GPUs) running Llama-3 70B TP=8 PP=4 would be the ideal
+validation** — it uses Meta's actual published training config and shows the sweet spot
+at seq=8192, mbs=2.
+
 ### What Still Needs Validation (next steps)
 
 1. **Simulator memory validation (DONE).** Validated on H100 with PyTorch 2.10 and
@@ -650,13 +676,24 @@ seq_lens (4K-16K)**. These are configs practitioners actually use.
    Confirms the "free lunch" claim.  The small overhead is from checkpoint bookkeeping,
    not from the recomputed FLOPs.
 
-3. **Pipeline-aware AC on realistic configs (TODO — requires 4+ GPUs).** The simulator
-   predicts +23.2% throughput for Llama-3 70B (TP=8, PP=4, seq=8192, mbs=2) on H100. This
-   is the priority validation target because it uses Meta's actual training config. Requires
-   modifying Megatron-LM's `--recompute-granularity` to accept per-stage strategies, then
-   running on 4 nodes of 8×H100 (or 32 GPUs total).
+3. **Pipeline-aware throughput — 8 GPU validation (TODO).**
+   Qwen3-8B, TP=2, PP=4, DP=1 on 8 H100s. Three runs:
+   - (a) Uniform Full AC — baseline
+   - (b) Uniform No AC — should OOM on stage 0 (confirms memory pressure)
+   - (c) Pipeline-aware: FA-Selective on stage 0, No AC on stages 1-3
+   Test at seq=4096/mbs=4 or seq=8192/mbs=2. Simulator predicts (c) is +23-25% faster
+   than (a). Requires modifying Megatron-LM's `--recompute-granularity` to accept
+   per-stage configs. The FA-Selective patch is the same `_silu_mul` checkpoint from
+   `validate_on_gpu.py`, applied only to stage 0's layers.
+   **This validates the simulator but uses an artificial config.**
 
-4. **Multi-schedule validation (TODO — requires 4+ GPUs).** Test with ZB-H1/H2 (available
+4. **Pipeline-aware throughput — 32 GPU validation (TODO, ideal).**
+   Llama-3 70B, TP=8, PP=4, DP=1 on 32 H100s (4 nodes). Same three-way comparison.
+   Simulator predicts +23.2% at seq=8192, mbs=2. This is Meta's published training
+   config and would be the strongest possible evidence.
+   **This validates both the simulator AND the practical relevance.**
+
+5. **Multi-schedule validation (TODO — stretch goal).** Test with ZB-H1/H2 (available
    in the zero-bubble codebase) to confirm the schedule-interaction predictions.
 
 ### Current state of evidence
