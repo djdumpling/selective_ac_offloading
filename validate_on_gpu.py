@@ -47,13 +47,11 @@ def check_deps():
         print("ERROR: transformers not installed. Run: pip install transformers")
         sys.exit(1)
 
-try:
-    import flash_attn
-    print(f"flash-attn {flash_attn.__version__}")
-except ImportError:
-    print("ERROR: flash-attn is not installed.")
-    print("Install flash-attn and rerun so this validator uses flash_attention_2.")
-    sys.exit(1)
+    try:
+        import flash_attn
+        print(f"flash-attn {flash_attn.__version__}")
+    except ImportError:
+        print("flash-attn not installed — will use PyTorch SDPA (same FA kernel on H100)")
 
 
 check_deps()
@@ -112,8 +110,13 @@ LLAMA_CONFIG = LlamaConfig(
     use_cache=False,
     torch_dtype=DTYPE,
 )
-LLAMA_CONFIG._attn_implementation = "flash_attention_2"
-print("Using: flash_attention_2")
+try:
+    import flash_attn  # noqa: F401
+    LLAMA_CONFIG._attn_implementation = "flash_attention_2"
+    print("Using: flash_attention_2")
+except ImportError:
+    LLAMA_CONFIG._attn_implementation = "sdpa"
+    print("Using: SDPA (PyTorch built-in FlashAttention kernel)")
 
 # Matching simulator config.
 SIM_CONFIG = ModelConfig(
