@@ -31,10 +31,31 @@ def main():
     with open(path, "rb") as f:
         snapshot = pickle.load(f)
 
-    # Snapshot format: list of segment dicts, each with "blocks" list
-    # Each block has "size", "state" (active_allocated, etc.), and "frames"
+    # Detect snapshot format
+    if isinstance(snapshot, dict):
+        segments = snapshot.get("segments", [])
+    elif isinstance(snapshot, list):
+        segments = snapshot
+    else:
+        print(f"Unknown snapshot type: {type(snapshot)}")
+        print(f"Keys: {snapshot.keys() if hasattr(snapshot, 'keys') else 'N/A'}")
+        return
+
+    # Debug: show structure if segments aren't dicts
+    if segments and not isinstance(segments[0], dict):
+        print(f"Snapshot top-level type: {type(snapshot)}")
+        if isinstance(snapshot, dict):
+            print(f"Keys: {list(snapshot.keys())}")
+            for k, v in snapshot.items():
+                print(f"  {k}: type={type(v)}, len={len(v) if hasattr(v, '__len__') else 'N/A'}")
+                if isinstance(v, list) and v:
+                    print(f"    [0] type={type(v[0])}")
+                    if isinstance(v[0], dict):
+                        print(f"    [0] keys={list(v[0].keys())[:10]}")
+        return
+
     blocks = []
-    for segment in snapshot:
+    for segment in segments:
         for block in segment.get("blocks", []):
             if block.get("state") == "active_allocated":
                 size = block["size"]
