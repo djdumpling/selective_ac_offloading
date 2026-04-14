@@ -35,7 +35,7 @@ def check_deps():
             sys.exit(1)
         print(f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"HBM: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+        print(f"HBM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     except ImportError:
         print("ERROR: PyTorch not installed. Run: pip install torch")
         sys.exit(1)
@@ -164,7 +164,7 @@ def peak_mem():
 def detect_gpu_profile() -> GPUConfig:
     """Map the current CUDA device to the closest simulator hardware profile."""
     name = torch.cuda.get_device_name(0).lower()
-    total_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
     if "h100" in name:
         return H100_80GB
