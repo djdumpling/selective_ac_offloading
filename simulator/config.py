@@ -193,6 +193,16 @@ H100_80GB = GPUConfig(
     peak_fp8_tflops=1979.0,
 )
 
+H200_141GB = GPUConfig(
+    name="h200-sxm-141gb",
+    hbm_capacity_gb=141.0,
+    hbm_bandwidth_gb_s=4800.0,      # HBM3e, 4.8 TB/s
+    peak_fp16_tflops=989.0,         # Same compute as H100
+    pcie_bandwidth_gb_s=64.0,       # PCIe Gen5 x16
+    nvlink_bandwidth_gb_s=450.0,    # NVLink 4.0
+    peak_fp8_tflops=1979.0,
+)
+
 
 # ── Pre-built Model Profiles ────────────────────────────────────────────────
 

@@ -1,0 +1,16 @@
+# Runtime dependencies. Simulator + tests need only pytest.
+# GPU validators (validate_on_gpu.py, throughput/run_pipeline.py) need torch + transformers.
+#
+# Install with uv (recommended on shared clusters):
+#   uv venv --python 3.11
+#   uv pip install torch --torch-backend=cu128   # pick the right CUDA tag for your box
+#   uv pip install -r requirements.txt
+#
+# pip alternative:
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+
+pytest>=7
+transformers>=5.0
+# torch is installed separately above because the wheel depends on the host CUDA version.

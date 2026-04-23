@@ -3,5 +3,17 @@
 __pycache__/
 .pytest_cache/
 
+# uv / virtualenvs
+.venv/
+.python-version
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
 # Local GPU validation artifacts
 memory_snapshot*.pickle
+
+# torchrun / torch.distributed
+core.*

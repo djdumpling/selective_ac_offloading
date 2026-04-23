@@ -9,6 +9,7 @@ import pytest
 from simulator.config import (
     A100_80GB,
     H100_80GB,
+    H200_141GB,
     ModelConfig,
     ParallelismConfig,
     ActivationFunction,
@@ -905,6 +906,32 @@ class TestMultiSchedulePipeline:
             pr = simulate_pipeline_aware_ac(cfg, gpu, par, schedule=sched)
             assert len(pr.stages) == par.pp_size, f"Failed on {sched}"
             assert pr.overall_step_latency_s > 0, f"Zero latency on {sched}"
+
+
+class TestGPUConfigs:
+    """Hardware profile sanity checks."""
+
+    def test_h200_basic_fields(self):
+        """H200-141GB: 141 GB HBM3e at 4.8 TB/s, same compute as H100."""
+        assert H200_141GB.hbm_capacity_gb == 141.0
+        assert H200_141GB.hbm_bandwidth_gb_s == 4800.0
+        assert H200_141GB.peak_fp16_tflops == 989.0
+        # Matches H100's FP16 peak — the H200 differs only in memory, not compute.
+        assert H200_141GB.peak_fp16_tflops == H100_80GB.peak_fp16_tflops
+        assert H200_141GB.peak_fp8_tflops == 1979.0
+        assert H200_141GB.pcie_bandwidth_gb_s == 64.0  # PCIe Gen5
+
+    def test_h200_fits_llama_7b_no_ac(self):
+        """Llama-7B at seq=4096 should fit comfortably on a single H200 under
+        No AC — this is the regime where pipeline-aware AC degenerates to
+        uniform in the throughput runner."""
+        from simulator.environment import simulate_no_ac
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        result = simulate_no_ac(cfg, H200_141GB)
+        assert result.fits_in_memory, (
+            f"Llama-7B No AC should fit on H200-141GB, "
+            f"peak={result.total_peak_memory_bytes / 1024**3:.1f} GB"
+        )
 
 
 if __name__ == "__main__":
