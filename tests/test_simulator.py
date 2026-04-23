@@ -58,6 +58,7 @@ from simulator.environment import (
     simulate_selective_ac,
     simulate_fa_selective_ac,
     simulate_pipeline_aware_ac,
+    simulate_pipeline_custom_ac,
     simulate_pipeline_uniform_ac,
     print_result,
     _stash_count_1f1b,
@@ -1138,6 +1139,70 @@ class TestGPipeSchedule:
         for s_gpipe, s_f1b in zip(gpipe_pr.stages, f1b_pr.stages):
             assert order.index(s_gpipe.strategy_name) >= order.index(s_f1b.strategy_name), (
                 f"GPipe picked {s_gpipe.strategy_name!r}, 1F1B picked {s_f1b.strategy_name!r}"
+            )
+
+
+class TestPipelineCustomAC:
+    """simulate_pipeline_custom_ac: user passes the exact per-stage list."""
+
+    def test_custom_matches_uniform_when_assignments_equal(self):
+        """A custom list of [s, s, s, s] must produce the same result as
+        simulate_pipeline_uniform_ac(strategy_name=s)."""
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        uniform = simulate_pipeline_uniform_ac(
+            cfg, H200_141GB, par, strategy_name="Full AC",
+            schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
+        )
+        custom = simulate_pipeline_custom_ac(
+            cfg, H200_141GB, par,
+            strategy_assignments=["Full AC"] * 4,
+            schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
+        )
+        assert custom.bottleneck_step_latency_s == pytest.approx(
+            uniform.bottleneck_step_latency_s, rel=1e-12,
+        )
+        assert [s.strategy_name for s in custom.stages] == ["Full AC"] * 4
+
+    def test_custom_heterogeneous_picks_match_aware_when_aware_recommends(self):
+        """At Llama-7B PP=4 seq=32K μb=8, aware-AC picks
+        [Offload all MLP, Offload all MLP, No AC, No AC]. Feeding that exact
+        list into custom-AC should yield the identical pipeline result."""
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        aware = simulate_pipeline_aware_ac(
+            cfg, H200_141GB, par,
+            schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
+        )
+        aware_names = [s.strategy_name for s in aware.stages]
+        custom = simulate_pipeline_custom_ac(
+            cfg, H200_141GB, par,
+            strategy_assignments=aware_names,
+            schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
+        )
+        assert custom.bottleneck_step_latency_s == pytest.approx(
+            aware.bottleneck_step_latency_s, rel=1e-12,
+        )
+        assert [s.strategy_name for s in custom.stages] == aware_names
+
+    def test_length_mismatch_raises(self):
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        with pytest.raises(ValueError, match="expected pp_size=4"):
+            simulate_pipeline_custom_ac(
+                cfg, H200_141GB, par,
+                strategy_assignments=["No AC"] * 3,
+                schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
+            )
+
+    def test_unknown_strategy_raises(self):
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        with pytest.raises(ValueError, match="unknown strategy names"):
+            simulate_pipeline_custom_ac(
+                cfg, H200_141GB, par,
+                strategy_assignments=["No AC", "Bogus", "No AC", "No AC"],
+                schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=8,
             )
 
 

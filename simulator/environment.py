@@ -885,6 +885,62 @@ def simulate_pipeline_uniform_ac(
     )
 
 
+def simulate_pipeline_custom_ac(
+    cfg: ModelConfig,
+    gpu: GPUConfig,
+    par: ParallelismConfig,
+    strategy_assignments: list[str],
+    schedule=None,
+    efficiency: float = 0.5,
+    memory_budget_frac: float = 0.90,
+    num_microbatches: int = 16,
+    num_chunks: int = 2,
+    offload_sync_mode: SyncMode = "overlap",
+) -> PipelineResult:
+    """Simulate a user-specified per-stage AC assignment under any schedule.
+
+    Unlike `simulate_pipeline_aware_ac` (which walks `STRATEGY_LEVELS`
+    least-aggressive-first per stage) or `simulate_pipeline_uniform_ac`
+    (which applies one strategy everywhere), this takes the caller's exact
+    per-stage list. Used by the throughput runner's `--per-stage` override
+    so a manual experiment still gets a simulator prediction that matches
+    the strategies actually running on GPU.
+    """
+    from .pipeline_schedules import PipelineSchedule, get_schedule_profile
+
+    if schedule is None:
+        schedule = PipelineSchedule.ONE_F_ONE_B
+
+    pp_size = par.pp_size
+    assert pp_size >= 2, "Pipeline AC requires pp_size >= 2"
+    if len(strategy_assignments) != pp_size:
+        raise ValueError(
+            f"strategy_assignments has {len(strategy_assignments)} entries, "
+            f"expected pp_size={pp_size}"
+        )
+    known = {name for name, _ in STRATEGY_LEVELS}
+    unknown = [s for s in strategy_assignments if s not in known]
+    if unknown:
+        raise ValueError(
+            f"unknown strategy names {unknown}; expected any of {sorted(known)}"
+        )
+
+    profile = get_schedule_profile(schedule, cfg, par, num_microbatches, num_chunks)
+
+    return _run_pipeline_simulation(
+        cfg, gpu, par,
+        stash_counts=profile.stash_counts,
+        strategy_assignments=list(strategy_assignments),
+        extra_memory_per_stage=profile.extra_memory_per_stage,
+        efficiency=efficiency,
+        memory_budget_frac=memory_budget_frac,
+        schedule_name=profile.description,
+        bubble_fraction=profile.bubble_fraction,
+        num_microbatches=num_microbatches,
+        offload_sync_mode=offload_sync_mode,
+    )
+
+
 def print_pipeline_result(pr: PipelineResult) -> None:
     """Pretty-print a pipeline-aware simulation result."""
     if pr.schedule_name:

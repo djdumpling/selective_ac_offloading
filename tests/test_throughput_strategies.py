@@ -10,6 +10,7 @@ from throughput.strategies import (
     VALID_MODES,
     VALID_STAGE_STRATEGIES,
     interleaved_chunk_layer_spans,
+    parse_per_stage_override,
     pipeline_aware_stage_strategies,
     stage_strategies,
 )
@@ -244,3 +245,36 @@ class TestInterleavedChunkLayerSpans:
         spans = interleaved_chunk_layer_spans(32, 4, 4, 0)
         virtuals = [v for v, _, _ in spans]
         assert virtuals == sorted(virtuals)
+
+
+class TestParsePerStageOverride:
+    """--per-stage is the escape hatch for manual experiments: specify an
+    exact per-stage strategy list from the command line."""
+
+    def test_basic_parse(self):
+        assert parse_per_stage_override(
+            "offload-all-mlp,offload-all-mlp,no-ac,no-ac", 4,
+        ) == ["offload-all-mlp", "offload-all-mlp", "no-ac", "no-ac"]
+
+    def test_strips_whitespace(self):
+        assert parse_per_stage_override(
+            " no-ac , full-ac , no-ac , no-ac ", 4,
+        ) == ["no-ac", "full-ac", "no-ac", "no-ac"]
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="entries but --pp is"):
+            parse_per_stage_override("no-ac,no-ac,no-ac", 4)
+
+    def test_unknown_strategy_raises(self):
+        with pytest.raises(ValueError, match="not in"):
+            parse_per_stage_override("no-ac,selective,no-ac,no-ac", 4)
+
+    def test_pipeline_aware_not_valid_per_stage_entry(self):
+        """pipeline-aware is a picking mode, not a per-stage strategy."""
+        with pytest.raises(ValueError, match="not in"):
+            parse_per_stage_override("pipeline-aware,no-ac,no-ac,no-ac", 4)
+
+    def test_all_valid_stage_strategies_accepted(self):
+        for s in VALID_STAGE_STRATEGIES:
+            result = parse_per_stage_override(",".join([s] * 3), 3)
+            assert result == [s] * 3

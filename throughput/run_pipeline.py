@@ -67,13 +67,16 @@ from simulator.config import (  # noqa: E402
 from simulator.environment import (  # noqa: E402
     _stage_layer_span,
     simulate_pipeline_aware_ac,
+    simulate_pipeline_custom_ac,
     simulate_pipeline_uniform_ac,
 )
 from simulator.pipeline_schedules import PipelineSchedule  # noqa: E402
 from throughput.strategies import (  # noqa: E402
     RUNNER_TO_SIM_STRATEGY,
     VALID_MODES,
+    VALID_STAGE_STRATEGIES,
     interleaved_chunk_layer_spans,
+    parse_per_stage_override,
     pipeline_aware_stage_strategies,
     stage_strategies,
 )
@@ -346,6 +349,11 @@ def parse_args():
     p.add_argument("--pp", type=int, required=True)
     p.add_argument("--ac", default="pipeline-aware",
                    choices=list(VALID_MODES))
+    p.add_argument("--per-stage", default=None,
+                   help="Comma-separated per-stage strategy list (overrides "
+                        "--ac; length must equal --pp). Entries must be one of "
+                        f"{list(VALID_STAGE_STRATEGIES)}. Example: "
+                        "--per-stage offload-all-mlp,offload-all-mlp,no-ac,no-ac")
     p.add_argument("--schedule", default="1f1b", choices=list(VALID_SCHEDULES),
                    help="Pipeline schedule. 1f1b is Narayanan et al. 2021; "
                         "gpipe runs all forwards before any backward (worst memory); "
@@ -442,7 +450,11 @@ def main():
     sim_gpu = H200_141GB if args.gpu == "h200" else H100_80GB
     sim_par = ParallelismConfig(pp_size=args.pp)
     sim_schedule = RUNNER_TO_SIM_SCHEDULE[args.schedule]
-    if args.ac == "pipeline-aware":
+    # --per-stage overrides both uniform modes and pipeline-aware. This is the
+    # escape hatch for manual experiments ("I want to try exactly this shape").
+    if args.per_stage is not None:
+        strategies = parse_per_stage_override(args.per_stage, args.pp)
+    elif args.ac == "pipeline-aware":
         strategies = pipeline_aware_stage_strategies(
             sim_cfg, sim_gpu, sim_par,
             schedule=sim_schedule,
@@ -584,7 +596,19 @@ def main():
         # ── Simulator comparison ─────────────────────────────────────────
         # Reuse sim_gpu / sim_par / sim_schedule from the strategy-assignment step
         # above so the predicted per-stage strategies exactly match what ran on GPU.
-        if args.ac == "pipeline-aware":
+        if args.per_stage is not None:
+            # Caller chose the per-stage shape explicitly. Feed those exact
+            # strategies into the simulator so predicted matches measured.
+            sim_assignments = [RUNNER_TO_SIM_STRATEGY[s] for s in strategies]
+            pr_sim = simulate_pipeline_custom_ac(
+                sim_cfg, sim_gpu, sim_par,
+                strategy_assignments=sim_assignments,
+                schedule=sim_schedule,
+                num_microbatches=args.microbatches,
+                num_chunks=num_chunks,
+                offload_sync_mode=sync_mode,
+            )
+        elif args.ac == "pipeline-aware":
             pr_sim = simulate_pipeline_aware_ac(
                 sim_cfg, sim_gpu, sim_par,
                 schedule=sim_schedule,

@@ -60,6 +60,26 @@ def stage_strategies(ac_mode: str, pp_size: int) -> list[str]:
     )
 
 
+def parse_per_stage_override(raw: str, pp_size: int) -> list[str]:
+    """Parse the `--per-stage` comma-separated strategy list.
+
+    Validates length equals `pp_size` and every entry is a runner strategy
+    name (no `pipeline-aware` — that's a picking mode, not a stage strategy).
+    Returns the list in order.
+    """
+    strategies = [s.strip() for s in raw.split(",")]
+    if len(strategies) != pp_size:
+        raise ValueError(
+            f"--per-stage has {len(strategies)} entries but --pp is {pp_size}"
+        )
+    bad = [s for s in strategies if s not in VALID_STAGE_STRATEGIES]
+    if bad:
+        raise ValueError(
+            f"--per-stage entries not in {VALID_STAGE_STRATEGIES}: {bad}"
+        )
+    return strategies
+
+
 def interleaved_chunk_layer_spans(
     num_layers: int, pp_size: int, num_chunks: int, rank: int,
 ) -> list[tuple[int, int, int]]:
