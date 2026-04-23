@@ -35,12 +35,22 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
     checkpoint_wrapper,
 )
-from torch.distributed.pipelining import PipelineStage, Schedule1F1B
-from transformers import LlamaConfig
+from torch.distributed.pipelining import (
+    PipelineStage,
+    Schedule1F1B,
+    ScheduleGPipe,
+    ScheduleInterleaved1F1B,
+)
+from transformers import LlamaConfig, Qwen3Config
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
+)
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3DecoderLayer,
+    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,6 +62,7 @@ from simulator.config import (  # noqa: E402
     ParallelismConfig,
     llama_13b,
     llama_7b,
+    qwen3_8b,
 )
 from simulator.environment import (  # noqa: E402
     _stage_layer_span,
@@ -62,38 +73,79 @@ from simulator.pipeline_schedules import PipelineSchedule  # noqa: E402
 from throughput.strategies import (  # noqa: E402
     RUNNER_TO_SIM_STRATEGY,
     VALID_MODES,
+    interleaved_chunk_layer_spans,
+    pipeline_aware_stage_strategies,
     stage_strategies,
 )
 
 
+VALID_SCHEDULES = ("1f1b", "gpipe", "interleaved-1f1b")
+
+RUNNER_TO_SIM_SCHEDULE = {
+    "1f1b": PipelineSchedule.ONE_F_ONE_B,
+    "gpipe": PipelineSchedule.GPIPE,
+    "interleaved-1f1b": PipelineSchedule.ONE_F_ONE_B_INTERLEAVED,
+}
+
+
 # ── Model stage ──────────────────────────────────────────────────────────────
 
-def build_hf_config(model: str, seq: int) -> LlamaConfig:
-    """HuggingFace Llama config matching one of the simulator presets."""
+def build_hf_config(model: str, seq: int):
+    """HuggingFace config matching one of the simulator presets."""
     if model == "llama7b":
         hidden, layers, heads, ffn = 4096, 32, 32, 11008
         kv_heads = heads
+        cfg = LlamaConfig(
+            hidden_size=hidden,
+            intermediate_size=ffn,
+            num_hidden_layers=layers,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            hidden_act="silu",
+            max_position_embeddings=max(8192, seq),
+            rms_norm_eps=1e-5,
+            attention_dropout=0.0,
+            attention_bias=False,
+            mlp_bias=False,
+            vocab_size=32000,
+            use_cache=False,
+        )
     elif model == "llama13b":
-        hidden, layers, heads, ffn = 5120, 40, 40, 13824
-        kv_heads = heads
+        cfg = LlamaConfig(
+            hidden_size=5120,
+            intermediate_size=13824,
+            num_hidden_layers=40,
+            num_attention_heads=40,
+            num_key_value_heads=40,
+            hidden_act="silu",
+            max_position_embeddings=max(8192, seq),
+            rms_norm_eps=1e-5,
+            attention_dropout=0.0,
+            attention_bias=False,
+            mlp_bias=False,
+            vocab_size=32000,
+            use_cache=False,
+        )
+    elif model == "qwen3_8b":
+        # Mirrors simulator.config.qwen3_8b: GQA (8 KV heads) + QK-norm.
+        cfg = Qwen3Config(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=36,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_act="silu",
+            max_position_embeddings=max(8192, seq),
+            rms_norm_eps=1e-6,
+            attention_dropout=0.0,
+            attention_bias=False,
+            mlp_bias=False,
+            vocab_size=151936,
+            use_cache=False,
+        )
     else:
         raise ValueError(f"unknown model: {model}")
-
-    cfg = LlamaConfig(
-        hidden_size=hidden,
-        intermediate_size=ffn,
-        num_hidden_layers=layers,
-        num_attention_heads=heads,
-        num_key_value_heads=kv_heads,
-        hidden_act="silu",
-        max_position_embeddings=max(8192, seq),
-        rms_norm_eps=1e-5,
-        attention_dropout=0.0,
-        attention_bias=False,
-        mlp_bias=False,
-        vocab_size=32000,
-        use_cache=False,
-    )
     cfg._attn_implementation = "sdpa"  # SDPA dispatches to FA on H100/H200
     return cfg
 
@@ -143,6 +195,66 @@ class LlamaStage(nn.Module):
         return x
 
 
+class Qwen3Stage(nn.Module):
+    """Qwen3 analog of LlamaStage. Qwen3 adds per-head QK-norm and uses GQA
+    (8 KV heads on a 32-head model), but the `x, position_ids, position_embeddings`
+    call convention matches Llama's, so the stage wrapper is nearly identical."""
+
+    def __init__(
+        self,
+        hf_config: Qwen3Config,
+        layer_start: int,
+        layer_end: int,
+        is_first: bool,
+        is_last: bool,
+    ):
+        super().__init__()
+        self.is_first = is_first
+        self.is_last = is_last
+        if is_first:
+            self.embed_tokens = nn.Embedding(hf_config.vocab_size, hf_config.hidden_size)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(hf_config, layer_idx=i)
+            for i in range(layer_start, layer_end)
+        ])
+        if is_last:
+            self.norm = Qwen3RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
+        self.rotary = Qwen3RotaryEmbedding(hf_config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_first:
+            x = self.embed_tokens(x)
+        b, s, _ = x.shape
+        position_ids = torch.arange(s, device=x.device).unsqueeze(0).expand(b, -1)
+        position_embeddings = self.rotary(x, position_ids)
+        for layer in self.layers:
+            x = layer(
+                x,
+                attention_mask=None,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+        if self.is_last:
+            x = self.norm(x)
+        return x
+
+
+def build_stage_module(
+    model: str,
+    hf_config,
+    layer_start: int,
+    layer_end: int,
+    is_first: bool,
+    is_last: bool,
+) -> nn.Module:
+    """Factory: build the right stage class for the chosen model."""
+    if model in ("llama7b", "llama13b"):
+        return LlamaStage(hf_config, layer_start, layer_end, is_first, is_last)
+    if model == "qwen3_8b":
+        return Qwen3Stage(hf_config, layer_start, layer_end, is_first, is_last)
+    raise ValueError(f"unknown model: {model}")
+
+
 # ── AC / offload application ────────────────────────────────────────────────
 
 def _build_offload_mlp_forward(offload_all: bool, hook_factory):
@@ -179,8 +291,11 @@ def _install_offload_on_mlps(stage_module: nn.Module, offload_all: bool,
 
     patched = _build_offload_mlp_forward(offload_all, hook_factory)
 
+    # Both Llama and Qwen3 decoder layers expose an `.mlp` child with a
+    # monkey-patchable `forward`; wrap either when we encounter it.
+    decoder_types = (LlamaDecoderLayer, Qwen3DecoderLayer)
     for mod in stage_module.modules():
-        if isinstance(mod, LlamaDecoderLayer):
+        if isinstance(mod, decoder_types):
             mlp = mod.mlp
             if hasattr(mlp, "_original_forward_for_offload"):
                 continue
@@ -202,10 +317,11 @@ def apply_ac(
     if strategy == "no-ac":
         return
     if strategy == "full-ac":
+        decoder_types = (LlamaDecoderLayer, Qwen3DecoderLayer)
         apply_activation_checkpointing(
             stage_module,
             checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(m, preserve_rng_state=False),
-            check_fn=lambda m: isinstance(m, LlamaDecoderLayer),
+            check_fn=lambda m: isinstance(m, decoder_types),
         )
         return
     if strategy in ("offload-linear2", "offload-all-mlp"):
@@ -225,10 +341,19 @@ def apply_ac(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="llama7b", choices=["llama7b", "llama13b"])
+    p.add_argument("--model", default="llama7b",
+                   choices=["llama7b", "llama13b", "qwen3_8b"])
     p.add_argument("--pp", type=int, required=True)
     p.add_argument("--ac", default="pipeline-aware",
                    choices=list(VALID_MODES))
+    p.add_argument("--schedule", default="1f1b", choices=list(VALID_SCHEDULES),
+                   help="Pipeline schedule. 1f1b is Narayanan et al. 2021; "
+                        "gpipe runs all forwards before any backward (worst memory); "
+                        "interleaved-1f1b splits each rank into --num-chunks virtual stages "
+                        "for a smaller bubble.")
+    p.add_argument("--num-chunks", type=int, default=2,
+                   help="Virtual stages per rank for --schedule interleaved-1f1b. "
+                        "Ignored for other schedules.")
     p.add_argument("--seq", type=int, default=4096)
     p.add_argument("--mbs", type=int, default=1,
                    help="Per-microbatch batch size")
@@ -237,6 +362,16 @@ def parse_args():
     p.add_argument("--steps", type=int, default=5)
     p.add_argument("--gpu", default="h200", choices=["h200", "h100"])
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--offload-sync-mode", default="overlap", choices=["overlap", "serial"],
+        help=(
+            "Which offload stream model the simulator should predict. "
+            "'overlap' (default) matches the dedicated-stream fast path that "
+            "CPUOffloadHook installs on GPU. 'serial' models the default-stream "
+            "penalty (~+28%% at seq=2048 single-tensor offload) for users who "
+            "run naive saved_tensors_hooks without a dedicated stream."
+        ),
+    )
     return p.parse_args()
 
 
@@ -258,51 +393,98 @@ def main():
     dist.init_process_group(backend="nccl")
     torch.manual_seed(args.seed + rank)
 
-    # Build this rank's stage
+    # Build this rank's stage(s).
     hf_config = build_hf_config(args.model, args.seq)
     num_layers = hf_config.num_hidden_layers
 
     if args.model == "llama7b":
         sim_cfg = llama_7b(seq_len=args.seq, micro_batch_size=args.mbs)
-    else:
+    elif args.model == "llama13b":
         sim_cfg = llama_13b(seq_len=args.seq, micro_batch_size=args.mbs)
+    elif args.model == "qwen3_8b":
+        sim_cfg = qwen3_8b(seq_len=args.seq, micro_batch_size=args.mbs)
+    else:
+        raise SystemExit(f"unknown model: {args.model}")
 
-    start, end = _stage_layer_span(num_layers, args.pp, rank)
-    stage_mod = LlamaStage(
-        hf_config,
-        layer_start=start,
-        layer_end=end,
-        is_first=(rank == 0),
-        is_last=(rank == args.pp - 1),
-    ).to(device=device, dtype=torch.bfloat16)
+    # Interleaved schedules split each rank into --num-chunks virtual stages;
+    # 1f1b and gpipe use one stage per rank (num_chunks = 1).
+    is_interleaved = args.schedule == "interleaved-1f1b"
+    num_chunks = args.num_chunks if is_interleaved else 1
+    num_virtual_stages = args.pp * num_chunks
 
-    strategies = stage_strategies(args.ac, args.pp)
+    if is_interleaved:
+        chunk_spans = interleaved_chunk_layer_spans(
+            num_layers, args.pp, num_chunks, rank,
+        )
+    else:
+        s, e = _stage_layer_span(num_layers, args.pp, rank)
+        chunk_spans = [(rank, s, e)]
+
+    stage_mods: list[nn.Module] = []
+    for virtual_idx, layer_start, layer_end in chunk_spans:
+        is_first_global = virtual_idx == 0
+        is_last_global = virtual_idx == num_virtual_stages - 1
+        mod = build_stage_module(
+            args.model,
+            hf_config,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            is_first=is_first_global,
+            is_last=is_last_global,
+        ).to(device=device, dtype=torch.bfloat16)
+        stage_mods.append(mod)
+
+    # Per-stage strategy assignment. For `pipeline-aware` we delegate to the
+    # simulator, which walks STRATEGY_LEVELS least-aggressive-first and picks
+    # the first that fits each stage's HBM budget given the schedule's stash.
+    # The simulator is deterministic and torch-free, so every rank computes the
+    # same list without coordination.
+    sim_gpu = H200_141GB if args.gpu == "h200" else H100_80GB
+    sim_par = ParallelismConfig(pp_size=args.pp)
+    sim_schedule = RUNNER_TO_SIM_SCHEDULE[args.schedule]
+    if args.ac == "pipeline-aware":
+        strategies = pipeline_aware_stage_strategies(
+            sim_cfg, sim_gpu, sim_par,
+            schedule=sim_schedule,
+            num_microbatches=args.microbatches,
+        )
+    else:
+        strategies = stage_strategies(args.ac, args.pp)
     this_strat = strategies[rank]
-    # Per-rank offload state: one shared CUDA stream across all MLP hooks
-    # on this rank so GPU→CPU DMAs overlap with compute on the default stream.
+    sync_mode = args.offload_sync_mode
+    # Per-rank offload state: one shared CUDA stream across all MLP hooks on
+    # this rank (including across interleaved chunks) so GPU→CPU DMAs serialize
+    # on one PCIe lane but still overlap with compute on the default stream.
     offload_stream = None
     offload_hooks: list[CPUOffloadHook] = []
     if this_strat in ("offload-linear2", "offload-all-mlp"):
         offload_stream = torch.cuda.Stream(device=device)
-    apply_ac(
-        stage_mod,
-        this_strat,
-        offload_stream=offload_stream,
-        offload_hooks=offload_hooks,
-    )
+    for mod in stage_mods:
+        apply_ac(
+            mod,
+            this_strat,
+            offload_stream=offload_stream,
+            offload_hooks=offload_hooks,
+        )
 
     if rank == 0:
         gpu_label = args.gpu.upper()
         print(
             f"=== Pipeline run: {args.model} pp={args.pp} ac={args.ac} "
+            f"schedule={args.schedule} chunks={num_chunks} "
             f"seq={args.seq} mbs={args.mbs} μb={args.microbatches} "
             f"on {world_size}× {gpu_label} ==="
         )
-        print(f"Per-stage strategies: {strategies}")
+        print(f"Per-rank strategies: {strategies}")
+        print(f"Simulator offload_sync_mode: {sync_mode}")
     dist.barrier()
-    nparams = sum(p.numel() for p in stage_mod.parameters())
+    nparams = sum(p.numel() for mod in stage_mods for p in mod.parameters())
+    chunk_desc = ", ".join(
+        f"[{ls},{le})" for _, ls, le in chunk_spans
+    )
     print(
-        f"[rank {rank}] layers [{start},{end}) strategy={strategies[rank]} "
+        f"[rank {rank}] virtual_stages={[v for v, _, _ in chunk_spans]} "
+        f"layers={chunk_desc} strategy={strategies[rank]} "
         f"params={nparams / 1e9:.2f}B",
         flush=True,
     )
@@ -310,20 +492,29 @@ def main():
 
     # Runtime shape inference from the first .step() call; no example needed.
     global_batch = args.mbs * args.microbatches
-    stage = PipelineStage(
-        stage_mod,
-        stage_index=rank,
-        num_stages=args.pp,
-        device=device,
-    )
+    stage_objs = [
+        PipelineStage(mod, stage_index=v_idx, num_stages=num_virtual_stages, device=device)
+        for mod, (v_idx, _, _) in zip(stage_mods, chunk_spans)
+    ]
 
     def loss_fn(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Simple scalar loss; scale down so the gradient norm stays reasonable.
         return pred.float().sum() * 1e-6
 
-    schedule = Schedule1F1B(
-        stage, n_microbatches=args.microbatches, loss_fn=loss_fn
-    )
+    if args.schedule == "1f1b":
+        schedule = Schedule1F1B(
+            stage_objs[0], n_microbatches=args.microbatches, loss_fn=loss_fn,
+        )
+    elif args.schedule == "gpipe":
+        schedule = ScheduleGPipe(
+            stage_objs[0], n_microbatches=args.microbatches, loss_fn=loss_fn,
+        )
+    elif args.schedule == "interleaved-1f1b":
+        schedule = ScheduleInterleaved1F1B(
+            stage_objs, n_microbatches=args.microbatches, loss_fn=loss_fn,
+        )
+    else:  # pragma: no cover - argparse choices guarantee this
+        raise SystemExit(f"unknown schedule: {args.schedule}")
 
     input_ids = torch.randint(
         0, hf_config.vocab_size, (global_batch, args.seq), device=device
@@ -391,22 +582,25 @@ def main():
         print(f"  Wall clock / step: {wall_s / args.steps * 1000:.1f} ms")
 
         # ── Simulator comparison ─────────────────────────────────────────
-        gpu = H200_141GB if args.gpu == "h200" else H100_80GB
-        par = ParallelismConfig(pp_size=args.pp)
-
+        # Reuse sim_gpu / sim_par / sim_schedule from the strategy-assignment step
+        # above so the predicted per-stage strategies exactly match what ran on GPU.
         if args.ac == "pipeline-aware":
             pr_sim = simulate_pipeline_aware_ac(
-                sim_cfg, gpu, par,
-                schedule=PipelineSchedule.ONE_F_ONE_B,
+                sim_cfg, sim_gpu, sim_par,
+                schedule=sim_schedule,
                 num_microbatches=args.microbatches,
+                num_chunks=num_chunks,
+                offload_sync_mode=sync_mode,
             )
         else:
             name = RUNNER_TO_SIM_STRATEGY[args.ac]
             pr_sim = simulate_pipeline_uniform_ac(
-                sim_cfg, gpu, par,
+                sim_cfg, sim_gpu, sim_par,
                 strategy_name=name,
-                schedule=PipelineSchedule.ONE_F_ONE_B,
+                schedule=sim_schedule,
                 num_microbatches=args.microbatches,
+                num_chunks=num_chunks,
+                offload_sync_mode=sync_mode,
             )
 
         # Simulator's step_latency_s is per-microbatch at the bottleneck stage.

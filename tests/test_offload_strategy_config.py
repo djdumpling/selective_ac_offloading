@@ -151,3 +151,132 @@ class TestOffloadLinear2Simulation:
         expected = 2048 * 1 * 11008 * 2 * 32
         # Allow 1% slack for tp_size=1 division rounding etc.
         assert abs(saved - expected) / expected < 0.01
+
+
+def _build_mlp_offload_strategies(num_layers: int, tensor_names: list[str]):
+    return [
+        LayerStrategy(
+            layer_idx=i,
+            decisions={
+                n: TensorDecision(action=TensorAction.OFFLOAD_CPU)
+                for n in tensor_names
+            },
+        )
+        for i in range(num_layers)
+    ]
+
+
+class TestOffloadBusContention:
+    """Regression guard for schedule_offloads() wiring + interval-based bus model.
+
+    simulate() routes all OFFLOAD_CPU decisions per layer through a single
+    schedule_offloads() call, which packs sends and recvs on a shared
+    half-duplex PCIe bus. When total bus work fits within the liveness gap,
+    stall is zero (even with many tensors); when it overflows, excess
+    becomes stall.
+    """
+
+    def test_multi_tensor_offload_fits_without_stall_at_seq32k(self):
+        """At seq=32K on H200, the per-layer fwd+bwd compute window is ~180 ms
+        while the 4 MLP tensors need only 4×22ms=88ms of total bus time. An
+        interval-based scheduler packs everything into that window with zero
+        stall; the previous pcie_busy_until model wrongly predicted cascading
+        stalls because it claimed the bus through each recv's ALAP wait."""
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        strategies = _build_mlp_offload_strategies(
+            cfg.num_layers,
+            ["mlp_gate_output", "mlp_up_output", "mlp_silu_output", "mlp_linear2_input"],
+        )
+        result = simulate(cfg, H200_141GB, strategies=strategies)
+        assert result.total_offload_stall_s == 0.0, (
+            f"Expected 0 stall — bus work (88ms) fits in gap (~180ms). "
+            f"Got {result.total_offload_stall_s*1000:.1f} ms, suggesting "
+            f"pcie_busy_until regression."
+        )
+
+    def test_stall_appears_when_bus_overcommitted(self):
+        """When enough tensors are offloaded that total bus time exceeds the
+        liveness gap, stall must appear. Drive contention by offloading many
+        attention + MLP tensors at once in a config where compute is small."""
+        # Short seq so the compute window is small; include attention tensors
+        # to push total offload work past the per-layer gap.
+        cfg = llama_7b(seq_len=512, micro_batch_size=1)
+        # Offload every MLP tensor and the big attention intermediates.
+        names = [
+            "mlp_gate_output", "mlp_up_output", "mlp_silu_output", "mlp_linear2_input",
+            "attn_q", "attn_k", "attn_v", "attn_output",
+        ]
+        strategies = _build_mlp_offload_strategies(cfg.num_layers, names)
+        result = simulate(cfg, H200_141GB, strategies=strategies)
+        # We only need contention to exist somewhere; exact magnitude depends
+        # on the compute model.
+        assert result.total_offload_stall_s > 0, (
+            "Offloading 8 large tensors at seq=512 should overcommit the bus; "
+            "got 0 stall"
+        )
+
+    def test_single_tensor_matches_independent_model(self):
+        """When only one tensor per layer is offloaded, schedule_offloads and
+        the old independent-per-tensor stall formula must agree exactly —
+        schedule_offloads with a 1-element list reduces to the single-tensor
+        case. This is the regression guard for the validated seq=2048/4096
+        measurements in OBSERVATIONS.md (they used linear2-only offload)."""
+        from simulator.offload_model import compute_offload_result
+        from simulator.memory_model import get_all_tensors_per_layer
+
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        gpu = H200_141GB
+        par = ParallelismConfig()
+        strategies = _build_offload_linear2_strategies(cfg.num_layers)
+        result = simulate(cfg, gpu, strategies=strategies, par=par)
+
+        # With a single tensor, layer-0 stall should equal compute_offload_result's
+        # independent-deadline prediction. We reconstruct the gap calculation to
+        # compare apples-to-apples.
+        from simulator.compute_model import get_layer_compute_profile
+        from simulator.environment import (
+            _estimate_intra_block_liveness_gap,
+            _estimate_liveness_gap,
+        )
+        layer_compute = get_layer_compute_profile(cfg, gpu, par, efficiency=0.5)
+        gap_intra = _estimate_intra_block_liveness_gap(layer_compute)
+        tensors = get_all_tensors_per_layer(cfg, par)
+        linear2 = next(t for t in tensors if t.name == "mlp_linear2_input")
+        # mlp_linear2_input is not a boundary tensor (block != "layernorm"/"residual")
+        expected = compute_offload_result(linear2, gap_intra, gpu, par)
+        assert abs(result.per_layer[0].offload_stall_s - expected.stall_time_s) < 1e-12
+
+    def test_layer_stall_matches_direct_schedule_offloads(self):
+        """End-to-end contract: per-layer stall inside simulate() equals what
+        schedule_offloads() returns for the same tensors+gaps. Strong check
+        that the wiring is correct."""
+        from simulator.compute_model import get_layer_compute_profile
+        from simulator.environment import (
+            _estimate_intra_block_liveness_gap,
+            _estimate_liveness_gap,
+        )
+        from simulator.memory_model import get_all_tensors_per_layer
+        from simulator.offload_model import schedule_offloads
+
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        gpu = H200_141GB
+        par = ParallelismConfig()
+        offload_names = {
+            "mlp_gate_output", "mlp_up_output",
+            "mlp_silu_output", "mlp_linear2_input",
+        }
+        strategies = _build_mlp_offload_strategies(cfg.num_layers, list(offload_names))
+        sim = simulate(cfg, gpu, strategies=strategies, par=par)
+
+        # Reconstruct the per-layer (tensor, gap) pairs exactly as simulate() builds them.
+        layer_compute = get_layer_compute_profile(cfg, gpu, par, efficiency=0.5)
+        gap_boundary = _estimate_liveness_gap(0, cfg.num_layers, layer_compute)
+        gap_intra = _estimate_intra_block_liveness_gap(layer_compute)
+        tensors = get_all_tensors_per_layer(cfg, par)
+        pairs = [
+            (t, gap_boundary if t.block in ("layernorm", "residual") else gap_intra)
+            for t in tensors if t.name in offload_names
+        ]
+        expected = sum(r.stall_time_s for r in schedule_offloads(pairs, gpu, par))
+
+        assert abs(sim.per_layer[0].offload_stall_s - expected) < 1e-12

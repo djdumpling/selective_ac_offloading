@@ -36,7 +36,7 @@ from .config import (
     TensorDecision,
 )
 from .memory_model import TensorInfo, get_all_tensors_per_layer
-from .offload_model import OffloadResult, compute_offload_result
+from .offload_model import SyncMode, schedule_offloads
 
 
 # ── Result dataclasses ───────────────────────────────────────────────────────
@@ -235,6 +235,7 @@ def simulate(
     memory_budget_frac: float = 0.90,
     pipeline_stage: int = 0,
     num_microbatches_in_flight: int = 0,
+    offload_sync_mode: SyncMode = "overlap",
 ) -> SimulatorResult:
     """Run the full simulation.
 
@@ -280,6 +281,15 @@ def simulate(
             local_idx, num_local_layers, layer_compute)
         liveness_gap_intra = _estimate_intra_block_liveness_gap(layer_compute)
 
+        # Collect OFFLOAD_CPU decisions for this layer. Stall is computed after
+        # the per-tensor loop via schedule_offloads(), which models the
+        # half-duplex PCIe bus: when multiple tensors offload within one layer,
+        # their transfers queue on the shared bus instead of each hitting its
+        # own independent deadline. Summing per-tensor stalls as if independent
+        # is ~16% optimistic at PP=4 seq=32K on real H200 measurements.
+        offload_pending: list[tuple[TensorInfo, float]] = []
+        offload_stored_bytes: dict[str, float] = {}
+
         for tensor in tensors:
             # Look up decision for this tensor
             if strategy and tensor.name in strategy.decisions:
@@ -314,14 +324,8 @@ def simulate(
                     breakdown.tensor_details[tensor.name] = "RECOMPUTE (enclosing checkpoint)"
 
             elif decision.action == TensorAction.OFFLOAD_CPU:
-                result = compute_offload_result(tensor, gap, gpu, par)
-                breakdown.offloaded_bytes += stored_bytes
-                breakdown.offload_stall_s += result.stall_time_s
-                total_offload_stall += result.stall_time_s
-                breakdown.tensor_details[tensor.name] = (
-                    f"OFFLOAD (stall={result.stall_time_s * 1000:.2f}ms, "
-                    f"eff_bw={result.effective_bw_gb_s:.1f}GB/s)"
-                )
+                offload_pending.append((tensor, gap))
+                offload_stored_bytes[tensor.name] = stored_bytes
 
             elif decision.action == TensorAction.COMPRESS:
                 sb = cfg.seq_len * cfg.micro_batch_size
@@ -348,6 +352,24 @@ def simulate(
                     f"COMPRESS r={decision.compress_rank} "
                     f"({comp.compression_ratio:.2f}x, err={comp.estimated_relative_error:.4f}, "
                     f"flops={comp.total_flops:.2e})"
+                )
+
+        # Schedule this layer's offloads on a shared half-duplex PCIe bus.
+        # schedule_offloads sorts by decreasing liveness gap (agreeable
+        # deadlines) and serializes transfers — so stall on a later tensor
+        # reflects the bus being occupied by earlier ones. `sync_mode="serial"`
+        # switches to the no-overlap model: stall = round_trip per tensor.
+        if offload_pending:
+            offload_results = schedule_offloads(
+                offload_pending, gpu, par, sync_mode=offload_sync_mode,
+            )
+            for r in offload_results:
+                breakdown.offloaded_bytes += offload_stored_bytes[r.tensor_name]
+                breakdown.offload_stall_s += r.stall_time_s
+                total_offload_stall += r.stall_time_s
+                breakdown.tensor_details[r.tensor_name] = (
+                    f"OFFLOAD (stall={r.stall_time_s * 1000:.2f}ms, "
+                    f"eff_bw={r.effective_bw_gb_s:.1f}GB/s)"
                 )
 
         per_layer_results.append(breakdown)
@@ -648,6 +670,7 @@ def _run_pipeline_simulation(
     schedule_name: str = "",
     bubble_fraction: float = 0.0,
     num_microbatches: int = 16,
+    offload_sync_mode: SyncMode = "overlap",
 ) -> PipelineResult:
     """Core pipeline simulation: run each stage with its assigned strategy.
 
@@ -686,6 +709,7 @@ def _run_pipeline_simulation(
             memory_budget_frac=memory_budget_frac,
             pipeline_stage=stage_idx,
             num_microbatches_in_flight=stash_count,
+            offload_sync_mode=offload_sync_mode,
         )
 
         # Account for per-stage extra memory (e.g., ZB-H2 deferred gradients)
@@ -752,6 +776,7 @@ def simulate_pipeline_aware_ac(
     memory_budget_frac: float = 0.90,
     num_microbatches: int = 16,
     num_chunks: int = 2,
+    offload_sync_mode: SyncMode = "overlap",
 ) -> PipelineResult:
     """Simulate non-uniform AC across pipeline stages under any schedule.
 
@@ -761,6 +786,7 @@ def simulate_pipeline_aware_ac(
 
     Args:
         schedule: A PipelineSchedule enum value, or None for 1F1B default.
+        offload_sync_mode: See `simulator.offload_model.SyncMode`.
     """
     from .pipeline_schedules import PipelineSchedule, get_schedule_profile
 
@@ -796,6 +822,7 @@ def simulate_pipeline_aware_ac(
                 memory_budget_frac=memory_budget_frac,
                 pipeline_stage=stage_idx,
                 num_microbatches_in_flight=stash_count,
+                offload_sync_mode=offload_sync_mode,
             )
 
             # Check fit including per-stage extra memory
@@ -816,6 +843,7 @@ def simulate_pipeline_aware_ac(
         schedule_name=profile.description,
         bubble_fraction=profile.bubble_fraction,
         num_microbatches=num_microbatches,
+        offload_sync_mode=offload_sync_mode,
     )
 
 
@@ -829,6 +857,7 @@ def simulate_pipeline_uniform_ac(
     memory_budget_frac: float = 0.90,
     num_microbatches: int = 16,
     num_chunks: int = 2,
+    offload_sync_mode: SyncMode = "overlap",
 ) -> PipelineResult:
     """Simulate uniform AC across all pipeline stages under any schedule."""
     from .pipeline_schedules import PipelineSchedule, get_schedule_profile
@@ -852,6 +881,7 @@ def simulate_pipeline_uniform_ac(
         schedule_name=profile.description,
         bubble_fraction=profile.bubble_fraction,
         num_microbatches=num_microbatches,
+        offload_sync_mode=offload_sync_mode,
     )
 
 

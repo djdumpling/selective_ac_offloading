@@ -40,6 +40,7 @@ from simulator.offload_model import (
     transfer_time,
     round_trip_time,
     can_overlap,
+    compute_offload_result,
     effective_pcie_bandwidth,
     estimate_nccl_pcie_utilization,
     schedule_offloads,
@@ -326,6 +327,151 @@ class TestOffloadModel:
         one_way = transfer_time(size, A100_80GB)
         expected_second_stall = 2 * one_way
         assert results[1].stall_time_s == pytest.approx(expected_second_stall)
+
+    def test_schedule_offloads_packs_sends_into_recv_wait_window(self):
+        """Interval-based scheduler: when gap is much larger than round-trip,
+        multiple tensors should pack into the window [send_end, recv_start]
+        that the recv's ALAP placement leaves idle. The old pcie_busy_until
+        model wrongly claimed the bus through recv_end and forced cascading
+        stalls even when bus time << gap."""
+        size = 100 * 1024 ** 2  # 100 MB, transfer ~ 3ms on A100 (32 GB/s)
+        gap = 0.500  # 500 ms gap — bus work (4 × 2 × 3 ms = 24 ms) << 500 ms
+        tensors = [
+            (TensorInfo(f"t{i}", "test", size, 0.0, []), gap)
+            for i in range(4)
+        ]
+
+        results = schedule_offloads(tensors, A100_80GB, ParallelismConfig())
+
+        # All four transfers must fit comfortably inside the gap.
+        total_stall = sum(r.stall_time_s for r in results)
+        assert total_stall == pytest.approx(0.0, abs=1e-9), (
+            f"Expected zero stall (bus work << gap); got {total_stall*1000:.2f} ms. "
+            f"Suggests pcie_busy_until cascade regression."
+        )
+
+    def test_schedule_offloads_stall_reflects_bus_overcommit(self):
+        """When total bus work exceeds the gap, excess becomes stall —
+        independent of how nicely tensors can pack."""
+        size = 1024 ** 3  # 1 GiB, ~32 ms transfer on A100
+        gap = 0.050  # 50 ms — only one round-trip (64 ms) already overflows
+        tensors = [
+            (TensorInfo(f"t{i}", "test", size, 0.0, []), gap)
+            for i in range(3)
+        ]
+
+        results = schedule_offloads(tensors, A100_80GB, ParallelismConfig())
+
+        # With 3 × 64 ms = 192 ms of bus work and gap=50 ms, at minimum
+        # 142 ms of cumulative stall across the three tensors is unavoidable.
+        total_stall = sum(r.stall_time_s for r in results)
+        one_way = transfer_time(size, A100_80GB)
+        minimum_stall = 3 * (2 * one_way) - gap * 3  # cumulative overshoot
+        assert total_stall >= minimum_stall - 1e-9, (
+            f"Total stall {total_stall*1000:.1f} ms < physical minimum "
+            f"{minimum_stall*1000:.1f} ms"
+        )
+
+    def test_schedule_offloads_symmetric_single_tensor_matches_independent(self):
+        """With one tensor, schedule_offloads must match compute_offload_result
+        exactly — the scheduler degenerates to the single-tensor case."""
+        from simulator.offload_model import compute_offload_result
+        size = 500 * 1024 ** 2  # 500 MB
+        gap = 0.030  # 30 ms — forces some stall at A100's ~16ms one-way
+        tensor = TensorInfo("t", "test", size, 0.0, [])
+
+        scheduled = schedule_offloads([(tensor, gap)], A100_80GB, ParallelismConfig())
+        independent = compute_offload_result(tensor, gap, A100_80GB, ParallelismConfig())
+
+        assert scheduled[0].stall_time_s == pytest.approx(independent.stall_time_s)
+        assert scheduled[0].send_time_s == pytest.approx(independent.send_time_s)
+        assert scheduled[0].recv_time_s == pytest.approx(independent.recv_time_s)
+
+
+class TestOffloadSyncMode:
+    """sync_mode='serial' models default-stream behavior where DMAs serialize
+    with compute and every offload pays full round-trip stall, regardless of
+    how much liveness slack exists."""
+
+    def test_serial_ignores_gap_and_returns_round_trip(self):
+        """Serial mode: stall = round_trip no matter how large the gap is."""
+        size = 100 * 1024 ** 2  # 100 MB
+        tensor = TensorInfo("t", "test", size, 0.0, [])
+
+        overlap = compute_offload_result(tensor, liveness_gap_s=10.0, gpu=A100_80GB)
+        serial = compute_offload_result(
+            tensor, liveness_gap_s=10.0, gpu=A100_80GB, sync_mode="serial",
+        )
+
+        # With a 10-second gap, overlap predicts zero stall; serial predicts rt.
+        assert overlap.stall_time_s == pytest.approx(0.0)
+        assert serial.stall_time_s == pytest.approx(serial.round_trip_s)
+        assert serial.stall_time_s > 0
+
+    def test_serial_schedule_offloads_sums_round_trips(self):
+        """Serial mode: total stall across tensors is sum of round-trips
+        (no bus scheduling — each transfer blocks compute on its own)."""
+        size = 100 * 1024 ** 2
+        gap = 1.0  # huge gap — overlap mode would predict zero stall
+        tensors = [
+            (TensorInfo(f"t{i}", "test", size, 0.0, []), gap)
+            for i in range(4)
+        ]
+
+        overlap_results = schedule_offloads(tensors, A100_80GB, ParallelismConfig())
+        serial_results = schedule_offloads(
+            tensors, A100_80GB, ParallelismConfig(), sync_mode="serial",
+        )
+
+        assert sum(r.stall_time_s for r in overlap_results) == pytest.approx(0.0)
+        expected_serial_stall = sum(r.round_trip_s for r in serial_results)
+        assert sum(r.stall_time_s for r in serial_results) == pytest.approx(
+            expected_serial_stall
+        )
+
+    def test_overlap_is_default(self):
+        """Default sync_mode must be 'overlap' — preserves existing behavior
+        for all callers that don't pass the new argument."""
+        size = 10 * 1024 ** 2
+        tensor = TensorInfo("t", "test", size, 0.0, [])
+        # Gap = 2 × transfer should give zero stall under overlap.
+        one_way = transfer_time(size, A100_80GB)
+        gap = 3 * one_way
+        result = compute_offload_result(tensor, gap, A100_80GB)  # no sync_mode
+        assert result.stall_time_s == pytest.approx(0.0)
+
+    def test_simulate_threads_sync_mode_through(self):
+        """simulate() wires offload_sync_mode into schedule_offloads; the
+        measured total stall at seq=2048 linear2-only offload should jump
+        from 0 (overlap) to ~1.4 ms × num_layers (serial)."""
+        from simulator.config import H200_141GB, llama_7b, LayerStrategy
+        from simulator.config import TensorAction, TensorDecision
+        from simulator.environment import simulate
+
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        strategies = [
+            LayerStrategy(
+                layer_idx=i,
+                decisions={
+                    "mlp_linear2_input": TensorDecision(action=TensorAction.OFFLOAD_CPU),
+                },
+            )
+            for i in range(cfg.num_layers)
+        ]
+
+        overlap = simulate(cfg, H200_141GB, strategies=strategies)
+        serial = simulate(
+            cfg, H200_141GB, strategies=strategies, offload_sync_mode="serial",
+        )
+
+        # Overlap mode: 2048×11008×2=45 MB/layer at 64 GB/s → 0.7 ms one-way,
+        # 1.4 ms round-trip — easily fits in the ~11 ms per-layer gap.
+        assert overlap.total_offload_stall_s == pytest.approx(0.0)
+
+        # Serial mode: 1.4 ms × 32 layers = ~45 ms per microbatch.
+        expected_ms = 32 * 2 * 2048 * 11008 * 2 / (64 * 1024**3) * 1000  # ~44.7 ms
+        actual_ms = serial.total_offload_stall_s * 1000
+        assert abs(actual_ms - expected_ms) / expected_ms < 0.05
 
 
 class TestCompressionModel:
@@ -906,6 +1052,73 @@ class TestMultiSchedulePipeline:
             pr = simulate_pipeline_aware_ac(cfg, gpu, par, schedule=sched)
             assert len(pr.stages) == par.pp_size, f"Failed on {sched}"
             assert pr.overall_step_latency_s > 0, f"Zero latency on {sched}"
+
+
+class TestGPipeSchedule:
+    """GPipe: uniform worst-case stash (all stages hold all M microbatches),
+    bubble = (PP-1) / (M + PP - 1)."""
+
+    def test_gpipe_stash_is_uniform_and_equals_m_minus_1(self):
+        from simulator.pipeline_schedules import get_schedule_profile
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        M = 8
+        profile = get_schedule_profile(
+            PipelineSchedule.GPIPE, cfg, par, num_microbatches=M,
+        )
+        assert profile.stash_counts == [M - 1] * par.pp_size
+
+    def test_gpipe_stash_exceeds_1f1b_by_m_minus_pp(self):
+        """At M=8, PP=4: GPipe stashes 7 everywhere; 1F1B stashes [3,2,1,0].
+        GPipe's worst-case stage has 7 - 3 = 4 more microbatches stashed."""
+        from simulator.pipeline_schedules import get_schedule_profile
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        gpipe = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, 8)
+        f1b = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par, 8)
+        assert max(gpipe.stash_counts) - max(f1b.stash_counts) == 8 - 4
+
+    def test_gpipe_bubble_formula(self):
+        """GPipe bubble = (PP-1) / (M + PP - 1). At PP=4 M=8: 3/11 ≈ 27.3%."""
+        from simulator.pipeline_schedules import get_schedule_profile
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        p = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, 8)
+        assert abs(p.bubble_fraction - 3 / 11) < 1e-9
+
+    def test_gpipe_bubble_smaller_than_1f1b_at_small_m(self):
+        """At M=PP, 1F1B bubble = (PP-1)/PP while GPipe bubble = (PP-1)/(2PP-1).
+        GPipe is smaller when M is close to PP (fewer microbatches in flight)."""
+        from simulator.pipeline_schedules import get_schedule_profile
+        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        g = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, 4)
+        f = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par, 4)
+        assert g.bubble_fraction < f.bubble_fraction
+
+    def test_pipeline_aware_on_gpipe_picks_more_aggressive(self):
+        """Because GPipe stashes M-1 per stage vs 1F1B's PP-1-p, aware-AC under
+        GPipe should pick at least as aggressive a strategy at every stage
+        (and strictly more aggressive on some when GPipe stash > 1F1B stash)."""
+        from simulator.config import H200_141GB
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        par = ParallelismConfig(pp_size=4)
+        M = 8
+
+        gpipe_pr = simulate_pipeline_aware_ac(
+            cfg, H200_141GB, par,
+            schedule=PipelineSchedule.GPIPE, num_microbatches=M,
+        )
+        f1b_pr = simulate_pipeline_aware_ac(
+            cfg, H200_141GB, par,
+            schedule=PipelineSchedule.ONE_F_ONE_B, num_microbatches=M,
+        )
+        order = ["No AC", "Offload linear2", "Offload all MLP",
+                 "FA-Selective", "Korthikanti Selective", "Full AC"]
+        for s_gpipe, s_f1b in zip(gpipe_pr.stages, f1b_pr.stages):
+            assert order.index(s_gpipe.strategy_name) >= order.index(s_f1b.strategy_name), (
+                f"GPipe picked {s_gpipe.strategy_name!r}, 1F1B picked {s_f1b.strategy_name!r}"
+            )
 
 
 class TestGPUConfigs:

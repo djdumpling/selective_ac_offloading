@@ -26,6 +26,7 @@ from .config import ModelConfig, ParallelismConfig
 class PipelineSchedule(Enum):
     ONE_F_ONE_B = "1f1b"
     ONE_F_ONE_B_INTERLEAVED = "1f1b_interleaved"
+    GPIPE = "gpipe"
     ZB_H1 = "zb_h1"
     ZB_H2 = "zb_h2"
     ZB_V = "zb_v"
@@ -49,6 +50,16 @@ class ScheduleProfile:
 def _stash_1f1b(stage: int, pp: int) -> int:
     """1F1B: stage p stashes (PP-1-p) microbatches during warmup."""
     return max(0, pp - 1 - stage)
+
+
+def _stash_gpipe(stage: int, pp: int, num_microbatches: int) -> int:
+    """GPipe: every stage runs forward on all M microbatches before any backward
+    starts, so every stage holds all M microbatches' activations simultaneously.
+
+    This is the worst case for activation memory — why 1F1B was invented.
+    Unlike 1F1B, the stash is independent of stage index.
+    """
+    return max(0, num_microbatches - 1)
 
 
 def _stash_1f1b_interleaved(stage: int, pp: int) -> int:
@@ -132,6 +143,18 @@ def _bubble_1f1b_interleaved(pp: int, num_microbatches: int, num_chunks: int = 2
     return (pp - 1) / (num_microbatches * num_chunks)
 
 
+def _bubble_gpipe(pp: int, num_microbatches: int) -> float:
+    """GPipe bubble: (PP-1) / (M + PP - 1).
+
+    Forward of M microbatches takes M + (PP-1) time (last mb doesn't finish
+    until (M-1) + PP steps), and same for backward. Bubble fraction is thus
+    (PP-1) / (M + PP - 1) per direction.
+    """
+    if num_microbatches == 0:
+        return 1.0
+    return (pp - 1) / (num_microbatches + pp - 1)
+
+
 def _bubble_zero() -> float:
     """ZB schedules and DualPipe: zero or near-zero bubble."""
     return 0.0
@@ -199,6 +222,14 @@ def get_schedule_profile(
         extras = zero_extras
         desc = (f"1F1B Interleaved (v={num_chunks}): "
                 f"same stash as 1F1B, bubble={bubble:.1%}")
+
+    elif schedule == PipelineSchedule.GPIPE:
+        # Uniform worst-case stash: every stage holds all M microbatches' activations.
+        stash_counts = [_stash_gpipe(s, pp, num_microbatches) for s in range(pp)]
+        bubble = _bubble_gpipe(pp, num_microbatches)
+        extras = zero_extras
+        desc = (f"GPipe: uniform stash (all stages={max(stash_counts)}), "
+                f"bubble={bubble:.1%}")
 
     elif schedule == PipelineSchedule.ZB_H1:
         stash_counts = [_stash_zb_h1(s, pp) for s in range(pp)]

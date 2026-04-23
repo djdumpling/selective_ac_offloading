@@ -97,13 +97,33 @@ and per-rank peak HBM against the simulator's predictions.
 # 4 GPUs, no checkpointing:
 ./throughput/launch.sh 4 no-ac --seq 4096 --mbs 1 --microbatches 8
 
-# 4 GPUs, pipeline-aware (full-ac on first half of stages, no-ac on the rest):
-./throughput/launch.sh 4 pipeline-aware --seq 4096 --mbs 1 --microbatches 8
+# 4 GPUs, pipeline-aware (simulator picks the least-aggressive strategy per stage):
+./throughput/launch.sh 4 pipeline-aware --seq 32768 --mbs 1 --microbatches 8
 ```
 
 The first argument is `pp_size` (also `--nproc_per_node`); the second is one of
-`no-ac`, `full-ac`, `pipeline-aware`. Rank 0 prints a measured-vs-predicted
-comparison at the end of each run.
+`no-ac`, `full-ac`, `pipeline-aware`, `offload-linear2`, `offload-all-mlp`.
+Rank 0 prints a measured-vs-predicted comparison at the end of each run.
+
+Additional flags:
+- `--schedule {1f1b, gpipe, interleaved-1f1b}` (default `1f1b`). GPipe is the
+  worst-memory / smallest-bubble-at-low-M schedule; interleaved cuts the bubble
+  by `1/num_chunks` while keeping the same per-stage memory as 1F1B.
+- `--num-chunks N` (default 2, interleaved only). Virtual stages per rank.
+- `--model {llama7b, llama13b, qwen3_8b}`. Qwen3-8B exercises the GQA + QK-norm
+  paths in the memory model under pipeline parallelism.
+- `--offload-sync-mode {overlap, serial}` controls which stream-discipline
+  prediction the simulator reports (overlap = dedicated stream, serial =
+  default stream).
+
+`pipeline-aware` is the interesting case: every rank calls the simulator's
+`simulate_pipeline_aware_ac()` to pick the least-aggressive strategy (from
+`No AC → Offload linear2 → Offload all MLP → FA-Selective → Korthikanti → Full AC`)
+that fits its HBM budget given the 1F1B stash. E.g. at Llama-7B PP=4 seq=32K
+μb=8, the picks are `[offload-all-mlp, offload-all-mlp, no-ac, no-ac]` — early
+stages get the aggressive treatment because they stash 2-3 microbatches; late
+stages fit No AC. This is the repo's real thesis: the value isn't in any single
+strategy but in applying the *right* strategy per stage.
 
 Scope: v1 supports the 1F1B schedule only; optimizer step is intentionally
 skipped so measured wall time is directly comparable to the simulator's
@@ -130,13 +150,20 @@ Short-context validation (seq=4096, mbs=1, μb=8):
 |---|---|---|---|---|
 | No AC | **OOM** | — | — | — |
 | Full AC | ✓ | 15,384 | 17,040 tok/s | 27 GB |
-| **Offload all MLP** | **✓** | **13,927** | **18,821 tok/s** | 103 GB |
+| **Offload all MLP (uniform)** | **✓** | **13,927** | **18,821 tok/s** | 103 GB |
+| Pipeline-aware `[offload, offload, none, none]` | ✓ | *GPU measurement pending* | — | — |
 
 At long context, selective CPU offload of MLP activations beats Full AC by
 **+10.4% throughput** on an 8× H200 NVLink node. No AC OOMs (208 GB per
-stage under 1F1B stash); offload reduces peak to 103 GB while PCIe Gen5
+stage under 1F1B stash); uniform offload reduces peak to 103 GB while PCIe Gen5
 (64 GB/s per lane) is fast enough to overlap with compute, so the recompute
 overhead of Full AC (+33% nominal) dominates the offload overhead.
+
+The simulator's `pipeline-aware` pick only offloads on stages 0-1 (which
+stash 2-3 microbatches of activations), leaving stages 2-3 at `no-ac` —
+saving their PCIe bandwidth for nothing. That heterogeneous assignment
+should beat uniform `offload-all-mlp` at this config; measurement pending
+on the next GPU access.
 
 Per-rank peak HBM under No AC decreases 30 → 24 → 18 → 13 GB across stages 0-3
 at short context, matching the 1F1B `(PP − 1 − p)` stash formula.

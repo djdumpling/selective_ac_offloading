@@ -715,9 +715,11 @@ at seq=8192, mbs=2.
 | DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument |
 | ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation |
 | PCIe offload memory cost is exact | **Validated ✓** | H200: Llama-7B mlp_linear2_input offload matches simulator to 0.0% at seq=2048 and seq=4096 |
-| PCIe offload overlap is stream-dependent | **Observed** | Dedicated CUDA stream: +1.5% overhead (matches simulator); default stream: +28.6% overhead (simulator doesn't model the serialization) |
+| PCIe offload overlap is stream-dependent | **Validated ✓ (v5)** | Dedicated CUDA stream (sync_mode="overlap"): +1.5%/+0.4% at seq=2048/4096, matches simulator to 0%. Default stream (sync_mode="serial"): +28.6%/+24.9% measured, simulator predicts +42ms/+84ms (within 5-15%). Selectable via `offload_sync_mode` parameter on `simulate()` / `simulate_pipeline_*()` and `--offload-sync-mode` on the runner. |
 | Selective offload beats Full AC on modern H200 NVLink | **Validated ✓** | 4× H200, Llama-7B, PP=4, seq=32K: offload-all-mlp +12.5% throughput vs Full AC at μb=4, +10.4% at μb=8 |
 | Pipeline offload has real PCIe bus contention | **Observed** | Per-tensor independent stall model is 16% optimistic at PP=4 seq=32K. `schedule_offloads` (half-duplex) is the right model to wire in |
+| `schedule_offloads` wired into `simulate()` | **Implemented v4** | Multi-tensor offload now accounts for shared PCIe bus. Overcorrects to 44% pessimistic at PP=4 seq=32K because `pcie_busy_until = recv_end` overcounts the ALAP wait interval — needs interval-based bus model as followup |
+| Interval-based bus scheduler replaces `pcie_busy_until` | **Implemented v4a** | Sends + recvs now pack into a sorted list of busy intervals. At PP=4 seq=32K, bus work (88ms) fits comfortably in the per-layer gap (~180ms) → predicted stall = 0, step returns to 11,980ms. The 14% optimism vs measured (13,927ms) is **not** explained by bus contention at this config; something else (stream dispatch, DMA setup, first-mb effects) is responsible |
 
 ---
 
@@ -838,3 +840,227 @@ implementation costs 25-30% throughput — which the simulator currently does
 not reflect. Either the cost model should gain a "sync mode" input, or
 implementations using `saved_tensors_hooks` should document that a dedicated
 stream is non-optional.
+
+---
+
+## Finding: Wiring `schedule_offloads` into `simulate()` overcorrects the +16% optimism
+
+### Change (2026-04-23, v4)
+
+`simulator/environment.py` now collects all OFFLOAD_CPU decisions per layer
+into a pending list and calls `schedule_offloads(pairs, gpu, par)` once per
+layer, instead of summing `compute_offload_result(tensor, gap)` per tensor
+as if each transfer had its own PCIe lane. This is the wiring Andrew named as
+"the natural next cost-model improvement."
+
+Regression tests (`tests/test_offload_strategy_config.py::TestOffloadBusContention`)
+pin the new behavior:
+- `test_single_tensor_matches_independent_model` — with one OFFLOAD_CPU tensor
+  per layer, `schedule_offloads`'s result is identical to the independent
+  formula, so the validated seq=2048/4096 measurements do not move.
+- `test_stall_monotonic_in_offload_count` — offloading more tensors per layer
+  produces more stall under the bus model.
+- `test_layer_stall_matches_direct_schedule_offloads` — the per-layer stall in
+  `SimulatorResult.per_layer[i].offload_stall_s` equals a direct
+  `schedule_offloads` call on the same tensors+gaps.
+
+### Predicted-vs-measured sign flip
+
+At the validated PP=4, seq=32K, μb=8 offload-all-mlp config:
+
+| Model | Predicted step (ms) | Measured (ms) | Error |
+|---|---|---|---|
+| Independent per-tensor stall (before) | 11,980 | 13,927 | **−14% (optimistic)** |
+| `schedule_offloads` wired in (after) | **20,043** | 13,927 | **+44% (pessimistic)** |
+
+The wiring is directionally correct (it now accounts for multiple tensors
+competing for one PCIe lane), but the swing to pessimism is larger than the
+original optimism. The +16% gap the wiring was meant to close is now a
+−28% gap in the other direction.
+
+### Root cause: `pcie_busy_until = recv_end` overcounts the bus
+
+Reading `simulator/offload_model.py::schedule_offloads` lines 182–197:
+
+```python
+send_start = max(0.0, pcie_busy_until)
+send_end = send_start + send
+recv_start = max(send_end, gap - recv)   # ALAP: schedule recv close to deadline
+recv_end = recv_start + recv
+pcie_busy_until = recv_end                # ← overcount
+```
+
+The recv is scheduled ALAP (as late as possible so it finishes at the
+deadline). That means the interval `[send_end, recv_start]` is *bus idle* —
+the send has finished and the recv is waiting for its deadline. Other
+tensors' sends *could* fire in that window, but `pcie_busy_until = recv_end`
+claims the bus is occupied all the way through. Subsequent tensors are
+forced to queue behind a gap that isn't really there.
+
+At the seq=32K offload-all-mlp config, each of the 4 offloaded MLP tensors
+per layer has transfer time T ≈ 11 ms (721 MB at 64 GB/s PCIe Gen5). Under
+the current scheduler:
+
+| Tensor | send | recv (ALAP) | pcie_busy_until after |
+|---|---|---|---|
+| 1 | [0, 11] | [gap−11, gap] | gap |
+| 2 | [gap, gap+11] | [gap+11, gap+22] | gap+22 |
+| 3 | [gap+22, gap+33] | [gap+33, gap+44] | gap+44 |
+| 4 | [gap+44, gap+55] | [gap+55, gap+66] | gap+66 |
+
+Stalls cascade linearly: 0, 22, 44, 66 ms per tensor. But physically, bus
+time for all 4 tensors is 88 ms (4 × 22 ms round trip); under a proper
+interval-based scheduler, excess stall is `max(0, 88 − overlap_window)`,
+not `0 + 22 + 44 + 66 = 132 ms`.
+
+### Followup: interval-based bus model
+
+The fix is to replace the scalar `pcie_busy_until` with a list of busy
+intervals and place each send in the earliest free slot (and each recv in
+the latest free slot ≤ deadline, after its send). That should land
+predicted step latency between the old optimistic and new pessimistic
+numbers — ideally within ±5% of measured.
+
+Until that lands, the simulator's offload stall is a known overestimate at
+configs with ≥2 OFFLOAD_CPU tensors per layer. Single-tensor offload
+configs (the validated seq=2048/4096 path) are unaffected.
+
+| Claim | Status | Evidence |
+|---|---|---|
+| Wiring accounts for multi-tensor bus contention | **Implemented** | `environment.py` per-layer schedule_offloads call + 4 new tests |
+| Wiring reduces 16% optimism at PP=4 seq=32K | **No** — overcorrects to 44% pessimism | Delta driven by `pcie_busy_until = recv_end` overcount |
+| schedule_offloads needs interval-based scheduling | **Proposed** | See task #1a |
+
+---
+
+## Finding: Interval-based bus scheduler replaces `pcie_busy_until`; 14% PP=4 seq=32K gap is not bus contention
+
+### Change (2026-04-23, v4a)
+
+`simulator/offload_model.py::schedule_offloads` now maintains a sorted list
+of non-overlapping busy intervals instead of a single `pcie_busy_until`
+cursor. Each tensor's send goes into the earliest free slot starting at
+t ≥ 0 (drain the queue fast, free memory early); each recv goes into the
+latest free slot whose end ≤ deadline (ALAP — don't block earlier-deadline
+recvs). When no deadline-meeting slot exists, the recv is pushed past the
+deadline and the excess is stall.
+
+Two helpers, `_earliest_free_slot` and `_latest_free_slot_by_deadline`,
+walk the busy list in forward / reverse order respectively. Insertion is
+binary-searched into the sorted list. All sends and recvs from all tensors
+end up as non-overlapping intervals, so subsequent tensors correctly see
+the real bus availability (including the window between an earlier
+tensor's send and its ALAP recv).
+
+### Predicted-vs-measured at PP=4 seq=32K μb=8
+
+| Model | Predicted step (ms) | Measured (ms) | Error |
+|---|---|---|---|
+| Independent per-tensor stall (pre-v4) | 11,980 | 13,927 | −14% |
+| `schedule_offloads` with `pcie_busy_until` (v4) | 20,043 | 13,927 | +44% |
+| **Interval-based (v4a, current)** | **11,980** | 13,927 | **−14%** |
+
+The interval-based scheduler predicts **zero stall** at this config, because
+per-layer bus work (4 × 22 ms = 88 ms for the four MLP tensors) fits
+comfortably inside the per-layer compute window (fwd + bwd ≈ 180 ms). That
+prediction is physically correct — the bus genuinely has headroom here —
+and the 14% gap vs. measured is therefore **not** explained by multi-tensor
+bus contention. Likely remaining sources:
+
+- `saved_tensors_hooks` dispatch overhead (per-tensor Python hook cost ×
+  32 layers × 8 microbatches).
+- CUDA DMA launch latency per copy that doesn't amortize into bandwidth.
+- Per-microbatch first-touch effects (allocator warm-up, pinned-buffer
+  reuse) the analytical model treats as zero.
+- The simulator's MFU constant (0.5) is slightly off for this specific
+  kernel mix at long context.
+
+### Where the interval-based scheduler actually matters
+
+The fix is correct and necessary for regimes where bus work approaches or
+exceeds the liveness gap. A sweep of `llama_7b` offload-all-mlp over
+seq_len:
+
+| seq_len | Offload tensors | Predicted stall / mb (ms) |
+|---|---|---|
+| 512 | 4 | 5.25 |
+| 1024 | 4 | 10.50 |
+| 2048 | 4 | 0.00 |
+| 4096 | 4 | 0.00 |
+| 8192+ | 4 | 0.00 |
+
+At seq=512 and seq=1024 the compute window shrinks enough that bus time
+matters; the interval scheduler correctly reports that. Above seq=2048 the
+window dominates and stall is zero regardless.
+
+### What v4a did and didn't do
+
+- ✓ The bus model is now physically correct: single-tensor path unchanged
+  (verified by regression test), multi-tensor path accounts for the
+  half-duplex shared bus without the ALAP-wait overcount.
+- ✓ Previously failing tests that asserted the old broken behavior have
+  been replaced with tests that pin the correct behavior (both the
+  zero-stall-when-window-fits case and the nonzero-stall-when-overcommitted
+  case).
+- ✗ Did **not** close the 14% PP=4 seq=32K gap vs measured. Bus contention
+  was not the right diagnosis at that config.
+
+### What's next
+
+The 14% gap warrants a separate investigation. Candidates:
+
+1. **Measure the per-offload hook overhead** on GPU: wrap `CPUOffloadHook._pack`
+   with a profiler and see whether Python dispatch × 32 × 8 accounts for
+   ~200 ms per microbatch.
+2. **Add a per-transfer fixed overhead** to the PCIe cost model. Currently
+   `transfer_time = size / eff_bw`; adding a `+ launch_latency` term (e.g.
+   10-50 µs per copy) would model DMA setup cost.
+3. **Sweep the MFU constant** in `get_layer_compute_profile` — if 0.45
+   better matches long-context H200 measurements, that's a two-line fix.
+
+None of these are within the scope of the "wire `schedule_offloads`" task.
+For the simulator's purposes, the bus model is now right for the physics
+it was intended to capture.
+
+---
+
+## Finding: `offload_sync_mode` flag models the default-stream penalty
+
+### Change (2026-04-23, v5)
+
+`simulator/offload_model.py` gained a `SyncMode = Literal["overlap", "serial"]`
+parameter, threaded through `compute_offload_result`, `schedule_offloads`,
+`simulate()`, `simulate_pipeline_aware_ac()`, and `simulate_pipeline_uniform_ac()`.
+Exposed as `--offload-sync-mode` on the throughput runner.
+
+- `sync_mode="overlap"` (default): current behavior. DMAs run on a dedicated
+  CUDA stream; stall is computed by the interval-based bus scheduler. Matches
+  what `offload/hooks.py::CPUOffloadHook` does when given an `offload_stream`.
+- `sync_mode="serial"`: each transfer incurs stall = round_trip regardless of
+  liveness gap, because on the default stream DMAs block the next compute op.
+  The interval-based scheduler is skipped entirely.
+
+### Validation against the single-GPU offload measurements
+
+| seq | Predicted stall (serial) | Measured default-stream overhead | Error |
+|---|---|---|---|
+| 2048 | 41.99 ms | 49.7 ms | −15.5% |
+| 4096 | 83.98 ms | 88.6 ms | −5.2% |
+
+Both overlap and serial modes now have simulator predictions that agree with
+measurement to within ~5-15%. The remaining gap at seq=2048 is likely the
+same Python-hook dispatch overhead that accounts for the 14% discrepancy at
+PP=4 seq=32K.
+
+### Why this matters
+
+Without `sync_mode="serial"`, any naive user who calls `saved_tensors_hooks`
+without a dedicated stream would run into a 25-30% throughput cliff that the
+simulator claimed wouldn't happen. Now the simulator tells both stories, and
+the runner's `--offload-sync-mode` CLI makes it explicit which prediction to
+compare measurement against.
+
+This does not change the headline "offload beats Full AC" claim, which was
+always measured with a dedicated stream. It does mean future users can
+predict the cost of getting the stream discipline wrong before they burn a
+GPU-hour on it.

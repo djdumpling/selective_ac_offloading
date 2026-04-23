@@ -6,8 +6,11 @@ import pytest
 
 from throughput.strategies import (
     RUNNER_TO_SIM_STRATEGY,
+    SIM_TO_RUNNER_STRATEGY,
     VALID_MODES,
     VALID_STAGE_STRATEGIES,
+    interleaved_chunk_layer_spans,
+    pipeline_aware_stage_strategies,
     stage_strategies,
 )
 
@@ -86,3 +89,158 @@ class TestRunnerToSimMapping:
                 f"runner mode {runner_name} → {sim_name!r} "
                 f"not in simulator STRATEGY_LEVELS {sim_names}"
             )
+
+    def test_sim_to_runner_inverse(self):
+        """SIM_TO_RUNNER_STRATEGY must be the exact inverse of RUNNER_TO_SIM_STRATEGY."""
+        for runner_name, sim_name in RUNNER_TO_SIM_STRATEGY.items():
+            assert SIM_TO_RUNNER_STRATEGY[sim_name] == runner_name
+
+    def test_unsupported_sim_strategies_absent(self):
+        """FA-Selective and Korthikanti don't have runner implementations — their
+        absence from SIM_TO_RUNNER_STRATEGY is what triggers the clear error in
+        pipeline_aware_stage_strategies()."""
+        assert "FA-Selective" not in SIM_TO_RUNNER_STRATEGY
+        assert "Korthikanti Selective" not in SIM_TO_RUNNER_STRATEGY
+
+
+class TestPipelineAwareStageStrategies:
+    """Simulator-driven heterogeneous strategy assignment. Covers the path that
+    the throughput runner actually uses for --ac pipeline-aware."""
+
+    def test_uniform_no_ac_when_plenty_of_hbm(self):
+        """At small seq_len, No AC fits every stage — pick should be uniform."""
+        from simulator.config import H200_141GB, ParallelismConfig, llama_7b
+        cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+        strategies = pipeline_aware_stage_strategies(
+            cfg, H200_141GB, ParallelismConfig(pp_size=4),
+            num_microbatches=8,
+        )
+        assert strategies == ["no-ac"] * 4
+
+    def test_heterogeneous_pick_at_seq32k_pp4(self):
+        """The validated config: PP=4 Llama-7B seq=32K. The simulator should
+        pick [offload-all-mlp, offload-all-mlp, no-ac, no-ac] — early stages
+        carry 1F1B stash pressure (PP-1-p = 3, 2 microbatches) and need
+        offload; late stages (stash=0,1) fit No AC."""
+        from simulator.config import H200_141GB, ParallelismConfig, llama_7b
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        strategies = pipeline_aware_stage_strategies(
+            cfg, H200_141GB, ParallelismConfig(pp_size=4),
+            num_microbatches=8,
+        )
+        assert strategies == [
+            "offload-all-mlp", "offload-all-mlp", "no-ac", "no-ac",
+        ]
+
+    def test_length_matches_pp_size(self):
+        from simulator.config import H200_141GB, ParallelismConfig, llama_7b
+        for pp in (2, 4, 8):
+            cfg = llama_7b(seq_len=16384, micro_batch_size=1)
+            strategies = pipeline_aware_stage_strategies(
+                cfg, H200_141GB, ParallelismConfig(pp_size=pp),
+                num_microbatches=8,
+            )
+            assert len(strategies) == pp
+
+    def test_monotonic_aggressiveness(self):
+        """Early stages must be at least as aggressive as later stages — the
+        simulator picks this way by construction (more stash = need to fit
+        tighter budget = more aggressive strategy)."""
+        from simulator.config import H200_141GB, ParallelismConfig, llama_7b
+        # Ordered least→most aggressive, matching STRATEGY_LEVELS order.
+        order = {
+            "no-ac": 0,
+            "offload-linear2": 1,
+            "offload-all-mlp": 2,
+            "full-ac": 3,
+        }
+        cfg = llama_7b(seq_len=32768, micro_batch_size=1)
+        strategies = pipeline_aware_stage_strategies(
+            cfg, H200_141GB, ParallelismConfig(pp_size=4),
+            num_microbatches=8,
+        )
+        levels = [order[s] for s in strategies]
+        assert all(a >= b for a, b in zip(levels, levels[1:])), (
+            f"non-monotonic: {strategies}"
+        )
+
+    def test_unsupported_strategy_raises(self):
+        """If the simulator picks FA-Selective or Korthikanti, the runner can't
+        execute it — we must raise a clear error rather than silently degrading
+        to a different strategy."""
+        import unittest.mock as mock
+        from types import SimpleNamespace
+
+        from simulator.config import H200_141GB, ParallelismConfig, llama_7b
+        fake_pr = SimpleNamespace(stages=[
+            SimpleNamespace(strategy_name="No AC"),
+            SimpleNamespace(strategy_name="FA-Selective"),  # unsupported
+            SimpleNamespace(strategy_name="No AC"),
+            SimpleNamespace(strategy_name="No AC"),
+        ])
+        with mock.patch(
+            "simulator.environment.simulate_pipeline_aware_ac",
+            return_value=fake_pr,
+        ):
+            cfg = llama_7b(seq_len=2048, micro_batch_size=1)
+            with pytest.raises(ValueError, match="FA-Selective"):
+                pipeline_aware_stage_strategies(
+                    cfg, H200_141GB, ParallelismConfig(pp_size=4),
+                    num_microbatches=8,
+                )
+
+
+class TestInterleavedChunkLayerSpans:
+    """Virtual-stage assignment for interleaved 1F1B. Each rank owns
+    `num_chunks` non-contiguous chunks at positions rank, rank+pp, rank+2pp, ..."""
+
+    def test_round_robin_assignment_pp4_chunks2(self):
+        """pp=4, num_chunks=2, 32 layers → 8 virtual stages, 4 layers each.
+        Rank 0: virtual stages 0, 4 → [0-4), [16-20).
+        Rank 1: virtual stages 1, 5 → [4-8), [20-24)."""
+        assert interleaved_chunk_layer_spans(32, 4, 2, 0) == [
+            (0, 0, 4),
+            (4, 16, 20),
+        ]
+        assert interleaved_chunk_layer_spans(32, 4, 2, 1) == [
+            (1, 4, 8),
+            (5, 20, 24),
+        ]
+        assert interleaved_chunk_layer_spans(32, 4, 2, 3) == [
+            (3, 12, 16),
+            (7, 28, 32),
+        ]
+
+    def test_num_chunks_1_matches_stage_layer_span(self):
+        """num_chunks=1 reduces to contiguous assignment (same as 1F1B)."""
+        from simulator.environment import _stage_layer_span
+        for rank in range(4):
+            spans = interleaved_chunk_layer_spans(32, 4, 1, rank)
+            assert len(spans) == 1
+            virtual, start, end = spans[0]
+            assert virtual == rank
+            assert (start, end) == _stage_layer_span(32, 4, rank)
+
+    def test_uneven_division_raises(self):
+        """32 layers can't split evenly into 3 pp × 2 chunks = 6 virtual stages."""
+        with pytest.raises(ValueError, match="divisible"):
+            interleaved_chunk_layer_spans(32, 3, 2, 0)
+
+    def test_invalid_args_raise(self):
+        with pytest.raises(ValueError):
+            interleaved_chunk_layer_spans(32, 0, 2, 0)
+        with pytest.raises(ValueError):
+            interleaved_chunk_layer_spans(32, 4, 0, 0)
+
+    def test_each_rank_gets_num_chunks_spans(self):
+        for num_chunks in (1, 2, 4):
+            for rank in range(4):
+                spans = interleaved_chunk_layer_spans(32, 4, num_chunks, rank)
+                assert len(spans) == num_chunks
+
+    def test_virtual_stage_ordering_within_rank(self):
+        """Chunks on a single rank appear in increasing virtual-stage order,
+        which matches the order torch.distributed.pipelining expects."""
+        spans = interleaved_chunk_layer_spans(32, 4, 4, 0)
+        virtuals = [v for v, _, _ in spans]
+        assert virtuals == sorted(virtuals)
