@@ -720,6 +720,7 @@ at seq=8192, mbs=2.
 | Pipeline offload has real PCIe bus contention | **Observed** | Per-tensor independent stall model is 16% optimistic at PP=4 seq=32K. `schedule_offloads` (half-duplex) is the right model to wire in |
 | `schedule_offloads` wired into `simulate()` | **Implemented v4** | Multi-tensor offload now accounts for shared PCIe bus. Overcorrects to 44% pessimistic at PP=4 seq=32K because `pcie_busy_until = recv_end` overcounts the ALAP wait interval — needs interval-based bus model as followup |
 | Interval-based bus scheduler replaces `pcie_busy_until` | **Implemented v4a** | Sends + recvs now pack into a sorted list of busy intervals. At PP=4 seq=32K, bus work (88ms) fits comfortably in the per-layer gap (~180ms) → predicted stall = 0, step returns to 11,980ms. The 14% optimism vs measured (13,927ms) is **not** explained by bus contention at this config; something else (stream dispatch, DMA setup, first-mb effects) is responsible |
+| Pipeline-aware sweet spot at 8-GPU PP=8 scale | **Validated ✓** | 8× H200, Llama-7B, PP=8, seq=32768, mbs=1, μb=8, 1F1B. Uniform No AC OOMs on ranks 0-2 (sim: 196/171/149 GB > 141 GB). Uniform Full AC fits at 24.7 GB, 25,090 tok/s. Pipeline-aware (offload-all-mlp × 3 + no-ac × 5, dispatched via `--per-stage`) fits at 125.8 GB peak, **32,076 tok/s = +27.8% vs Full AC**. Simulator predicted +29.0% — relative error within 1.2 pp. Does not substitute for literal Llama-3 70B TP=8 PP=4 on 32 GPUs, but confirms the mechanism on the largest config reachable on a single H200 node. |
 
 ---
 
@@ -1064,3 +1065,106 @@ This does not change the headline "offload beats Full AC" claim, which was
 always measured with a dedicated stream. It does mean future users can
 predict the cost of getting the stream discipline wrong before they burn a
 GPU-hour on it.
+
+---
+
+## Finding: Pipeline-aware sweet spot validated end-to-end at PP=8 on 8× H200
+
+### What we measured (2026-04-23, v6)
+
+**Config:** Llama-2-7B, single-node 8× H200 NVLink, PP=8 (TP=1, DP=1),
+seq_len=32768, mbs=1, μb=8, 1F1B, SDPA attention, bf16. Each rank owns 4
+decoder layers; stage 0 additionally holds the embedding, stage 7 the final
+RMSNorm. 2 warmup + 3 timed steps, CUDA event timing. Optimizer step
+intentionally omitted so measured step latency compares apples-to-apples
+against the simulator's fwd+bwd+recompute prediction.
+
+This is the natural 8-GPU proxy for OBSERVATIONS.md #4 (Llama-3 70B
+TP=8 PP=4 on 32 H100s). The literal config is not reachable on this
+hardware — the runner is PP-only and we only have one node — but the
+mechanism (stash pressure concentrated on early stages, heterogeneous
+strategies across the pipeline) is the same.
+
+### Three-way comparison
+
+| Strategy | Fits? | Bottleneck step | Throughput | Peak HBM (max stage) | Offload/step |
+|----------|-------|-----------------|------------|----------------------|--------------|
+| **No AC uniform** | **OOM** | — | — | ranks 0,1,2 OOM | — |
+| Full AC uniform | ✓ | 10,448 ms | 25,090 tok/s | 24.7 GB (stage 0) | 0 GB |
+| **Pipeline-aware** | ✓ | **8,173 ms** | **32,076 tok/s** | 125.8 GB (stage 3) | 170 GB (stages 0-2) |
+
+**Pipeline-aware beats Full AC by +27.8%** at this config. The No AC OOM
+happens exactly where the simulator says it will: ranks 0, 1, 2 (predicted
+peaks 196 / 171 / 149 GB vs 141 GB H200 HBM). The per-stage strategies
+dispatched — `offload-all-mlp` × 3 on the high-stash early stages,
+`no-ac` × 5 on the low-stash late stages — are the same ones
+`simulate_pipeline_aware_ac` independently chose.
+
+### Simulator accuracy
+
+| Claim | Predicted | Measured | Error |
+|---|---|---|---|
+| Pipeline-aware speedup over Full AC | +29.0% | **+27.8%** | **−1.2 pp** |
+| Full AC per-μb at bottleneck | 966 ms | 1,306 ms | +35.3% |
+| Pipeline-aware per-μb at bottleneck | 749 ms | 1,021 ms | +36.4% |
+| Full AC peak HBM stage 0 | 22.0 GB | 24.7 GB | +12.3% |
+
+The **relative** prediction — which is the one the simulator is actually
+selected on — lands within 1.2 percentage points of measured. On absolute
+per-microbatch latency the simulator is uniformly ~35% optimistic (same
+magnitude for both Full AC and the offload path), consistent with the PP=4
+seq=32K gap noted in the v4a finding above: the root cause is *not* bus
+contention, since both strategies undercount by the same amount and only
+one of them transfers anything. Best guesses: Python-side hook dispatch
+overhead, first-microbatch NCCL warmup effects, or MFU<0.5 at seq=32K.
+
+The bubble-inflated prediction (bubble fraction = (PP−1)/M = 87.5% at
+PP=M=8) overshoots in the other direction: Full AC predicted-with-bubble
+14,484 ms vs measured 10,448 ms = −27.9%. Measured sits symmetrically
+between the no-bubble and bubble-adjusted predictions. This suggests
+`torch.distributed.pipelining.Schedule1F1B` achieves meaningfully better
+overlap than the simulator's bubble model assumes at this M=PP corner.
+
+### What this validates
+
+- **Simulator's pipeline-aware recommendation is measurable** — not just
+  an analytical artifact. The same per-stage strategy picker that produced
+  "+23% on Llama-3 70B TP=8 PP=4" (listed in the evidence table as
+  Analytical ✓, needs multi-GPU validation) is now validated on an 8-GPU
+  proxy using exactly the same heuristic.
+- **No AC OOMs precisely where predicted** — ranks 0, 1, 2 at PP=8
+  seq=32K. The per-stage stash model (stage p stashes PP−1−p microbatches
+  under 1F1B) holds at the boundary.
+- **Offload scales with pipeline depth**. Prior PP=4 seq=32K result was
+  +10.4% (offload-all-mlp uniform vs Full AC uniform). At PP=8 the sweet
+  spot grows to +27.8% because offload is selective — applied only where
+  it pays, not uniformly.
+
+### Runner changes required
+
+The existing `--ac pipeline-aware` mode maps to `full-ac × half + no-ac × half`
+(see `throughput/strategies.py`), which is **not** what the simulator's
+`simulate_pipeline_aware_ac` picks at this config. Running that mode
+instead would leave the +27.8% on the table. A `--per-stage` CLI option
+was added so the runner can dispatch any explicit strategy list and
+compare to the simulator's heterogeneous recommendation directly:
+
+```bash
+./throughput/launch.sh 8 pipeline-aware --seq 32768 --mbs 1 --microbatches 8 \
+  --per-stage offload-all-mlp,offload-all-mlp,offload-all-mlp,no-ac,no-ac,no-ac,no-ac,no-ac
+```
+
+### Caveats
+
+- **Not the literal OBSERVATIONS.md #4 config.** That one calls for
+  Llama-3-70B TP=8 PP=4 on 32 H100s. It requires 4 nodes and TP support
+  in the runner (currently PP-only). The PP=8 Llama-2-7B config here is
+  the biggest config that shows a genuine pipeline-aware sweet spot
+  on 8× H200 with the existing runner.
+- **Optimizer step omitted.** Measured step time is fwd + bwd + recompute
+  only, per the repo's standing policy. Real training throughput would
+  include an optimizer step that's identical across strategies, so the
+  relative speedup is the meaningful comparison either way.
+- **Three timed steps per run.** Run-to-run noise was not characterized;
+  the 1.2 pp gap between predicted and measured speedup is within the
+  plausible noise floor at this step count.
