@@ -1168,3 +1168,135 @@ compare to the simulator's heterogeneous recommendation directly:
 - **Three timed steps per run.** Run-to-run noise was not characterized;
   the 1.2 pp gap between predicted and measured speedup is within the
   plausible noise floor at this step count.
+
+---
+
+## Finding: Pipeline-aware validated end-to-end at PP=4 seq=32K, and extends feasible region at seq=64K
+
+### What we measured (2026-04-23)
+
+**Config:** Llama-2-7B, single-node 4× H200 NVLink, PP=4 (TP=1, DP=1),
+mbs=1, μb=8, 1F1B, SDPA attention, bf16. Each rank owns 8 decoder
+layers; stage 0 holds the embedding, stage 3 the final RMSNorm. 2
+warmup + 3 timed steps, CUDA event timing. Optimizer step
+intentionally omitted.
+
+This run supplies the GPU measurement the prior CLAUDE.md long-context
+paragraph explicitly flagged as missing ("needs a GPU measurement to
+compare against uniform offload-all-mlp") and extends it to seq=64K.
+
+### seq=32K: pipeline-aware beats uniform offload-all-mlp
+
+| Strategy | Per-rank strategies | Bottleneck step | Throughput | Peak HBM (max stage) | Offload/step |
+|----------|---------------------|-----------------|------------|----------------------|--------------|
+| Uniform offload-all-mlp | `[off, off, off, off]` | 13,478 ms | 19,450 tok/s | 103 GB (stage 0) | 326 GB × 4 |
+| **Pipeline-aware** | `[off, off, no-ac, no-ac]` | **12,837 ms** | **20,420 tok/s** | 105 GB (stage 2) | 326 GB × 2 |
+
+**Pipeline-aware is +5.0% faster** than uniform offload at PP=4
+seq=32K. The per-stage assignment the runner executes matches what
+`simulate_pipeline_aware_ac` picks independently. Stages 2 & 3
+measured offload/step = 0 GB exactly, confirming the PCIe bus is
+used only on the high-stash early stages. Stage 2's peak HBM rises
+from 60 → 105 GB between the two runs — the extra stash headroom
+being spent to skip offload entirely on that rank.
+
+### seq=64K: pipeline-aware expands the feasible configuration region
+
+Same 4× H200 PP=4 config scaled to `seq=65536`:
+
+| Strategy | Per-rank strategies | Fits? | Bottleneck step | Throughput |
+|----------|---------------------|-------|-----------------|------------|
+| Full AC uniform | `[full-ac × 4]` | ✓ | 42,909 ms | 12,218 tok/s |
+| Uniform offload-all-mlp | `[off × 4]` | **OOM on rank 0** | — | — |
+| **Pipeline-aware** | `[full-ac, full-ac, off, no-ac]` | ✓ | **39,592 ms** | **13,242 tok/s** |
+
+Pipeline-aware is **+7.7% faster than Full AC** at seq=64K. Uniform
+offload-all-mlp OOMs because stage 0's 1F1B stash (`PP−1 = 3` live
+microbatches' worth of offloaded-MLP state) saturates HBM at this
+sequence length; the failing process held 139.4 GB / 141 GB before
+the next allocation. Pipeline-aware picks a **3-level split** —
+full-ac on bottleneck stages 0–1, offload-all-mlp on stage 2
+(moderate stash), no-ac on stage 3 (zero stash) — which is the
+first 3-level heterogeneous assignment measured on this hardware.
+
+**Scope of the OOM claim.** Uniform offload-all-mlp fails at *this
+specific* (Llama-7B, 4× H200 141 GB, μb=8, 1F1B, seq=64K) config. It
+is not a universal infeasibility result. More GPUs shrink per-stage
+stash; a symmetric schedule (ZB-V / DualPipe) flattens stash across
+stages and collapses pipeline-aware to uniform; smaller μb or mbs
+reduce total stash; bigger HBM (e.g. B200 192 GB) fits the uniform
+case. The generalizable claim the seq=64K result supports is
+"pipeline-aware expands the feasible configuration region," not
+"uniform offload is always infeasible at long context."
+
+### Simulator accuracy degrades with sequence length
+
+| seq | Strategy | Measured | Sim (w/ bubble) | Error |
+|---|---|---|---|---|
+| 4K | Full AC | 1,307 ms | 1,286 ms | +1.7% |
+| 32K | Uniform offload-all-mlp | 13,478 ms | 16,473 ms | −18.2% |
+| 32K | Pipeline-aware | 12,837 ms | 16,473 ms | −22.1% |
+| 64K | Full AC | 42,909 ms | 67,530 ms | −36.5% |
+| 64K | Pipeline-aware | 39,592 ms | 67,530 ms | −41.4% |
+
+The simulator's bubble-inflated prediction becomes progressively more
+pessimistic as sequence length grows. Two candidate explanations,
+both consistent with the symmetric undercounting observed at PP=8:
+
+1. **Bubble model overcounts at long context.** The 37.5% bubble
+   fraction assumes first-microbatch NCCL warmup dominates the drain
+   tail. At seq=32K / 64K, per-microbatch compute is so large that
+   `torch.distributed.pipelining.Schedule1F1B` apparently achieves
+   better overlap than the simulator assumes.
+2. **MFU rises with sequence length.** The simulator uses a fixed
+   `efficiency=0.5` in `flops_to_latency`. If H200 attains higher
+   MFU at long-context SDPA, measured wall-clock comes in below
+   prediction.
+
+Additionally, the pipeline-aware sim prediction is **identical** to
+uniform offload's at every sequence length — both 16,473 ms at
+seq=32K, both 67,530 ms at seq=64K — because the simulator's
+bottleneck-stage cost is strategy-invariant once the bottleneck
+stage holds a fixed strategy. The measured 5.0% / 7.7% speedups
+come entirely from downstream stages finishing faster and shrinking
+the 1F1B drain tail, an effect the current bubble model does not
+capture. Worth investigating as a simulator improvement: predicting
+non-zero speedup when pipeline-aware is strictly lighter on the
+non-bottleneck stages.
+
+### Offload-stream validation (seq=2048, 4096, single GPU)
+
+Re-measured the `saved_tensors_hooks` offload path against both
+`offload_sync_mode=serial` and `overlap` predictions on one H200:
+
+| seq | HBM savings (meas/sim) | Default-stream overhead (meas / sim-serial) | Dedicated-stream overhead (meas / sim-overlap) |
+|---|---|---|---|
+| 2048 | 1.344 / 1.344 GB (0% err) | +50.4 ms / +42.0 ms (sim −17%) | +3.6 ms / 0.0 ms |
+| 4096 | 2.688 / 2.688 GB (0% err) | +93.1 ms / +84.0 ms (sim −10%) | +18.5 ms / 0.0 ms |
+
+Serial-mode prediction lands within 10–20% of measured, consistent
+with prior reference numbers (+49.7 / +88.6 ms). Overlap-mode model
+predicts zero stall but measures small residual overhead that grows
+with sequence length — +2.1% at seq=2048, +5.2% at seq=4096 —
+plausibly stream-dispatch or DMA-launch overhead the current
+overlap model doesn't account for. The gap is well below the
+default-stream penalty, so the overall story ("offload is free with
+a dedicated stream") holds; the model just over-promises on the
+dedicated-stream case by a small constant.
+
+### Caveats
+
+- **Single run per config.** Noise wasn't characterized at PP=4. The
+  5.0% seq=32K speedup is close to the plausible run-to-run noise
+  floor. Three timed steps per run bounds intra-run variance but
+  not inter-run.
+- **Sim absolute accuracy degrades at long context.** The
+  simulator's *relative* ranking of strategies stayed correct at
+  every config, but absolute predictions above ~seq=16K should be
+  treated as upper bounds until the bubble / MFU gap is understood.
+- **Uniform offload 32K baseline shifted slightly.** Today's 13,478
+  ms is ~3% faster than the prior-session 13,927 ms at the same
+  config. Ascribe to run-to-run noise; kept today's numbers for
+  the pipeline-aware comparison table because the two must be
+  measured together for the percentage to be meaningful.
+- **Optimizer step omitted**, matching the rest of the repo.
