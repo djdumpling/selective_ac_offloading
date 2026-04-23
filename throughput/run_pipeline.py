@@ -25,6 +25,7 @@ import argparse
 import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import torch
@@ -44,6 +45,7 @@ from transformers.models.llama.modeling_llama import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from offload.hooks import CPUOffloadHook  # noqa: E402
 from simulator.config import (  # noqa: E402
     H100_80GB,
     H200_141GB,
@@ -57,7 +59,11 @@ from simulator.environment import (  # noqa: E402
     simulate_pipeline_uniform_ac,
 )
 from simulator.pipeline_schedules import PipelineSchedule  # noqa: E402
-from throughput.strategies import VALID_MODES, stage_strategies  # noqa: E402
+from throughput.strategies import (  # noqa: E402
+    RUNNER_TO_SIM_STRATEGY,
+    VALID_MODES,
+    stage_strategies,
+)
 
 
 # ── Model stage ──────────────────────────────────────────────────────────────
@@ -137,9 +143,62 @@ class LlamaStage(nn.Module):
         return x
 
 
-# ── AC application ───────────────────────────────────────────────────────────
+# ── AC / offload application ────────────────────────────────────────────────
 
-def apply_ac(stage_module: nn.Module, strategy: str) -> None:
+def _build_offload_mlp_forward(offload_all: bool, hook_factory):
+    """Return a patched `LlamaMLP.forward` that wraps the right sub-region in a
+    CPUOffloadHook. When offload_all=True, the whole MLP body is hooked so every
+    saved activation (gate_output, up_output, silu_output, linear2_input) goes
+    to pinned CPU. When False, only down_proj is hooked so only linear2_input
+    moves."""
+
+    def forward_linear2_only(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        linear2_input = self.act_fn(gate) * up
+        with hook_factory(self):
+            return self.down_proj(linear2_input)
+
+    def forward_all(self, x):
+        with hook_factory(self):
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            linear2_input = self.act_fn(gate) * up
+            return self.down_proj(linear2_input)
+
+    return forward_all if offload_all else forward_linear2_only
+
+
+def _install_offload_on_mlps(stage_module: nn.Module, offload_all: bool,
+                              stream: "torch.cuda.Stream | None",
+                              hooks: list[CPUOffloadHook]) -> None:
+    def hook_factory(_mlp):
+        h = CPUOffloadHook(min_bytes=1_000_000, offload_stream=stream)
+        hooks.append(h)
+        return h
+
+    patched = _build_offload_mlp_forward(offload_all, hook_factory)
+
+    for mod in stage_module.modules():
+        if isinstance(mod, LlamaDecoderLayer):
+            mlp = mod.mlp
+            if hasattr(mlp, "_original_forward_for_offload"):
+                continue
+            mlp._original_forward_for_offload = mlp.forward
+            mlp.forward = types.MethodType(patched, mlp)
+
+
+def apply_ac(
+    stage_module: nn.Module,
+    strategy: str,
+    offload_stream: "torch.cuda.Stream | None" = None,
+    offload_hooks: list[CPUOffloadHook] | None = None,
+) -> None:
+    """Install the per-stage strategy on `stage_module`.
+
+    For offload strategies, the caller provides a dedicated CUDA stream so the
+    GPU→CPU DMAs overlap with compute on the default stream; without it,
+    transfers serialize and throughput collapses (see offload/hooks.py)."""
     if strategy == "no-ac":
         return
     if strategy == "full-ac":
@@ -147,6 +206,16 @@ def apply_ac(stage_module: nn.Module, strategy: str) -> None:
             stage_module,
             checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(m, preserve_rng_state=False),
             check_fn=lambda m: isinstance(m, LlamaDecoderLayer),
+        )
+        return
+    if strategy in ("offload-linear2", "offload-all-mlp"):
+        if offload_hooks is None:
+            raise ValueError("offload_hooks list is required for offload strategies")
+        _install_offload_on_mlps(
+            stage_module,
+            offload_all=(strategy == "offload-all-mlp"),
+            stream=offload_stream,
+            hooks=offload_hooks,
         )
         return
     raise ValueError(f"unknown per-stage strategy: {strategy}")
@@ -208,7 +277,19 @@ def main():
     ).to(device=device, dtype=torch.bfloat16)
 
     strategies = stage_strategies(args.ac, args.pp)
-    apply_ac(stage_mod, strategies[rank])
+    this_strat = strategies[rank]
+    # Per-rank offload state: one shared CUDA stream across all MLP hooks
+    # on this rank so GPU→CPU DMAs overlap with compute on the default stream.
+    offload_stream = None
+    offload_hooks: list[CPUOffloadHook] = []
+    if this_strat in ("offload-linear2", "offload-all-mlp"):
+        offload_stream = torch.cuda.Stream(device=device)
+    apply_ac(
+        stage_mod,
+        this_strat,
+        offload_stream=offload_stream,
+        offload_hooks=offload_hooks,
+    )
 
     if rank == 0:
         gpu_label = args.gpu.upper()
@@ -284,20 +365,23 @@ def main():
 
     step_ms = start_evt.elapsed_time(end_evt) / args.steps
     peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    offload_gb = sum(h.stats.bytes_offloaded for h in offload_hooks) / (1024 ** 3) / max(1, args.steps)
 
     # Gather per-rank numbers
     all_step_ms = [0.0] * world_size
     all_peak_gb = [0.0] * world_size
+    all_offload_gb = [0.0] * world_size
     dist.all_gather_object(all_step_ms, step_ms)
     dist.all_gather_object(all_peak_gb, peak_gb)
+    dist.all_gather_object(all_offload_gb, offload_gb)
 
     if rank == 0:
         print()
         print("=== Results ===")
-        print(f"  {'rank':>4} {'strategy':<18} {'step (ms)':>11} {'peak HBM (GB)':>14}")
-        print(f"  {'-'*4} {'-'*18} {'-'*11} {'-'*14}")
-        for r, (sm, pg) in enumerate(zip(all_step_ms, all_peak_gb)):
-            print(f"  {r:>4} {strategies[r]:<18} {sm:>11.1f} {pg:>14.2f}")
+        print(f"  {'rank':>4} {'strategy':<18} {'step (ms)':>11} {'peak HBM (GB)':>14} {'offload/step (GB)':>18}")
+        print(f"  {'-'*4} {'-'*18} {'-'*11} {'-'*14} {'-'*18}")
+        for r, (sm, pg, og) in enumerate(zip(all_step_ms, all_peak_gb, all_offload_gb)):
+            print(f"  {r:>4} {strategies[r]:<18} {sm:>11.1f} {pg:>14.2f} {og:>18.2f}")
 
         bottleneck_ms = max(all_step_ms)
         tokens_per_s = global_batch * args.seq / (bottleneck_ms / 1000)
@@ -317,7 +401,7 @@ def main():
                 num_microbatches=args.microbatches,
             )
         else:
-            name = {"no-ac": "No AC", "full-ac": "Full AC"}[args.ac]
+            name = RUNNER_TO_SIM_STRATEGY[args.ac]
             pr_sim = simulate_pipeline_uniform_ac(
                 sim_cfg, gpu, par,
                 strategy_name=name,

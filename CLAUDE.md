@@ -33,11 +33,17 @@ The repo uses a uv-managed venv at `.venv/` (Python 3.11, torch 2.11 + cu128, tr
 .venv/bin/python snapshot_qwen3.py              # same for Qwen3
 .venv/bin/python analyze_snapshot.py memory_snapshot_no_ac.pickle  # parse a CUDA memory snapshot
 
+# Single-GPU selective offload validation (saved_tensors_hooks to pinned CPU):
+.venv/bin/python offload/validate_offload.py --seq 2048 --mbs 1            # default: compare both streams
+.venv/bin/python offload/validate_offload.py --seq 4096 --stream dedicated # measure overlap-enabled path only
+
 # Multi-GPU throughput validation (torch.distributed.pipelining, 1F1B):
 ./throughput/launch.sh 2 full-ac        --seq 2048 --mbs 1 --microbatches 4
 ./throughput/launch.sh 4 no-ac          --seq 4096 --mbs 1 --microbatches 8
 ./throughput/launch.sh 4 pipeline-aware --seq 4096 --mbs 1 --microbatches 8
-# First arg = pp_size (= nproc_per_node); second = {no-ac, full-ac, pipeline-aware}.
+./throughput/launch.sh 4 offload-all-mlp --seq 32768 --mbs 1 --microbatches 8   # long-context sweet spot
+# First arg = pp_size (= nproc_per_node); second = {no-ac, full-ac, pipeline-aware,
+#   offload-linear2, offload-all-mlp}.
 # Rank 0 prints measured vs. simulator-predicted step latency.
 ```
 
@@ -90,13 +96,30 @@ Stash counts and bubble fractions come from `simulator/pipeline_schedules.py`:
 
 The validators build `LlamaModel`/`AutoModel` with random weights, measure retained forward activations via CUDA memory reset + peak tracking and via `torch.autograd.graph.saved_tensors_hooks`, then compare to `simulate_no_ac` / `simulate_fa_selective_ac` / `simulate_full_ac`. Target is <5% error on retained forward activations. If a new architecture feature changes memory predictions, re-run these on GPU before trusting the simulator. `LlamaModel` (not `LlamaForCausalLM`) is deliberate so measurements track transformer activations, not LM-head logits.
 
+### Selective offload validation (`offload/validate_offload.py`)
+
+Offloads `mlp_linear2_input` on every Llama-2-7B decoder layer to pinned CPU via `torch.autograd.graph.saved_tensors_hooks`, then compares measured peak HBM and step-time overhead to `simulate(..., OFFLOAD_CPU)`. Reuses the `LlamaMLP.forward` monkeypatch pattern from `validate_on_gpu.py` so only tensors saved by `down_proj` get captured — gate/up/silu outputs remain on GPU. The hook filters parameter-like tensors (including views like `W.T` that `F.linear` saves) via `_is_parameter_like`, otherwise the PCIe bus fills with weight transposes and stalls compute.
+
+Two transfer modes: `--stream default` (DMA on the default CUDA stream → serializes with compute) and `--stream dedicated` (shared offload stream with cross-stream events → overlaps with compute). The simulator's `offload_model.py` assumes dedicated-stream behavior; the validator reports both so the gap is visible.
+
+```bash
+.venv/bin/python offload/validate_offload.py --seq 2048 --mbs 1
+.venv/bin/python offload/validate_offload.py --seq 4096 --mbs 1
+```
+
+**Measured on 1× H200, Llama-2-7B, mbs=1:** HBM savings match simulator to 0% at both seq=2048 (1.34 GB) and seq=4096 (2.69 GB). With a dedicated stream, step-time overhead is +1.5% / +0.4% respectively (vs. simulator's 0% prediction). With the default stream, overhead is +28.6% / +24.9% — useful as a measurement of the cost of naive synchronous offload.
+
 ### Multi-GPU throughput validation (`throughput/run_pipeline.py`)
 
 Pipeline-parallel runner on `torch.distributed.pipelining.Schedule1F1B`. Builds a hand-constructed `LlamaStage` per rank (embed on stage 0, `LlamaDecoderLayer` slice in the middle, final RMSNorm on stage N-1) — not `LlamaModel`, because HF's forward can't be trivially sharded. RoPE is recomputed per stage (weight-free). Activation checkpointing uses `apply_activation_checkpointing` with `checkpoint_wrapper` targeting `LlamaDecoderLayer`; per-stage policy comes from `throughput/strategies.py::stage_strategies` (kept torch-free so it's unit-testable). `pipeline-aware` puts Full AC on the first `pp_size // 2` ranks and No AC on the rest — mirrors `STRATEGY_LEVELS`'s least-aggressive-that-fits heuristic.
 
+CPU-offload modes (`offload-linear2`, `offload-all-mlp`) install the `LlamaMLP.forward` monkeypatch from `offload/hooks.py::CPUOffloadHook`. Each rank creates one shared CUDA stream so GPU→CPU DMAs overlap with compute on the default stream. Mapped to simulator strategy names via `throughput/strategies.py::RUNNER_TO_SIM_STRATEGY` so the runner can print simulator predictions for the same strategy.
+
 Optimizer step is intentionally omitted — measured step time is fwd + bwd + recompute only, directly comparable to the simulator's `step_latency_s`. Only 1F1B is wired up in v1; `torch.distributed.pipelining` ships `ScheduleInterleaved1F1B` / `ScheduleGPipe` that are easy to add. ZB-H1/H2/DualPipe would be larger lifts since they don't exist upstream.
 
-**Measured vs. simulator reference points on 4× H200 (Llama-7B, seq=4096, mbs=1, μb=8):** No AC 1004 ms (sim 1032 ms, −2.7%), Full AC 1309 ms (sim 1286 ms, +1.8%). The bubble-adjusted simulator prediction (`overall_step_latency_s × num_microbatches`) is the one to compare against, not `bottleneck_step_latency_s`. Note that for Llama-7B on 141 GB HBM, the simulator correctly recommends "No AC everywhere" — there's no sweet spot to validate heterogeneous AC until model size / seq_len / mbs push early stages into OOM under No AC.
+**Short-context reference points on 4× H200 (Llama-7B, seq=4096, mbs=1, μb=8):** No AC 1004 ms (sim 1032 ms, −2.7%), Full AC 1309 ms (sim 1286 ms, +1.8%). The bubble-adjusted simulator prediction (`overall_step_latency_s × num_microbatches`) is the one to compare against, not `bottleneck_step_latency_s`. At this scale all strategies fit on 141 GB HBM and the simulator recommends No AC everywhere.
+
+**Long-context sweet spot on 4× H200 (Llama-7B, seq=32768, mbs=1, μb=8):** No AC OOMs (sim predicts 208 GB/stage > 141 GB HBM). Full AC 15,384 ms / 17,040 tok/s at 27 GB peak. **Offload all MLP 13,927 ms / 18,821 tok/s at 103 GB peak (+10.4% throughput vs Full AC)**. This is the regime where the repo's thesis is defensible on modern NVLink hardware: activation memory dominates, PCIe Gen5 is fast enough for transfer/compute overlap, and recompute's 33% compute cost exceeds offload's real bus-contention cost. The simulator's `simulate()` path is optimistic on offload stall by ~16% at this pipeline configuration because it doesn't invoke `schedule_offloads` for multi-microbatch contention — wiring that in is the natural next cost-model improvement (see OBSERVATIONS.md).
 
 ## Reference material in repo
 

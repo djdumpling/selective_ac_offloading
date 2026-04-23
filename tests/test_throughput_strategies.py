@@ -4,7 +4,12 @@ run in the simulator-only CI path."""
 
 import pytest
 
-from throughput.strategies import VALID_MODES, stage_strategies
+from throughput.strategies import (
+    RUNNER_TO_SIM_STRATEGY,
+    VALID_MODES,
+    VALID_STAGE_STRATEGIES,
+    stage_strategies,
+)
 
 
 class TestStageStrategies:
@@ -55,4 +60,29 @@ class TestStageStrategies:
             levels = [order[s] for s in strategies]
             assert all(a >= b for a, b in zip(levels, levels[1:])), (
                 f"non-monotonic at pp={pp}: {strategies}"
+            )
+
+    def test_offload_linear2_uniform(self):
+        assert stage_strategies("offload-linear2", 4) == ["offload-linear2"] * 4
+
+    def test_offload_all_mlp_uniform(self):
+        assert stage_strategies("offload-all-mlp", 4) == ["offload-all-mlp"] * 4
+
+
+class TestRunnerToSimMapping:
+    """Every runner mode that maps 1:1 to a simulator strategy must be present
+    in `RUNNER_TO_SIM_STRATEGY`, and every target name must actually exist in
+    the simulator's `STRATEGY_LEVELS`."""
+
+    def test_all_uniform_modes_have_mapping(self):
+        for mode in VALID_STAGE_STRATEGIES:
+            assert mode in RUNNER_TO_SIM_STRATEGY, f"missing mapping for {mode}"
+
+    def test_mapped_names_exist_in_simulator(self):
+        from simulator.environment import STRATEGY_LEVELS
+        sim_names = {name for name, _ in STRATEGY_LEVELS}
+        for runner_name, sim_name in RUNNER_TO_SIM_STRATEGY.items():
+            assert sim_name in sim_names, (
+                f"runner mode {runner_name} → {sim_name!r} "
+                f"not in simulator STRATEGY_LEVELS {sim_names}"
             )

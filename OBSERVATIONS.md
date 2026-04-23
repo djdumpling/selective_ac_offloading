@@ -714,3 +714,127 @@ at seq=8192, mbs=2.
 | 3-Resource costs 1.6-3.2% overhead | Analytical ✓ | Needs GPU validation |
 | DualPipe nullifies pipeline-aware AC | Analytical ✓ | Structural argument |
 | ZB-H2 amplifies pipeline-aware AC | Analytical ✓ | Needs GPU validation |
+| PCIe offload memory cost is exact | **Validated ✓** | H200: Llama-7B mlp_linear2_input offload matches simulator to 0.0% at seq=2048 and seq=4096 |
+| PCIe offload overlap is stream-dependent | **Observed** | Dedicated CUDA stream: +1.5% overhead (matches simulator); default stream: +28.6% overhead (simulator doesn't model the serialization) |
+| Selective offload beats Full AC on modern H200 NVLink | **Validated ✓** | 4× H200, Llama-7B, PP=4, seq=32K: offload-all-mlp +12.5% throughput vs Full AC at μb=4, +10.4% at μb=8 |
+| Pipeline offload has real PCIe bus contention | **Observed** | Per-tensor independent stall model is 16% optimistic at PP=4 seq=32K. `schedule_offloads` (half-duplex) is the right model to wire in |
+
+---
+
+## Finding: Selective CPU offload beats Full AC on modern H200 NVLink clusters at long context
+
+### What we measured (2026-04-23, v3)
+
+**Config:** Llama-2-7B, PP=4 on 4× H200 NVLink (NV18), seq_len=32768, mbs=1,
+1F1B schedule, SDPA attention, bf16. Each rank owns 8 decoder layers. Results
+at two microbatch counts:
+
+**μb=4** (bubble fraction 75%, warmup-heavy):
+
+| Strategy | Fits? | Step (ms) | Throughput | Peak HBM (rank 0) | Offload/step |
+|----------|-------|-----------|------------|-------------------|--------------|
+| No AC | **OOM** | — | — | — | — |
+| Offload linear2 | **OOM** | — | — | — | — |
+| Full AC | ✓ | 9,743 | 13,452 tok/s | 24.7 GB | 0 GB |
+| **Offload all MLP** | **✓** | **8,658** | **15,139 tok/s** | 101.1 GB | 85 GB |
+
+**μb=8** (bubble fraction 37.5%, steady-state):
+
+| Strategy | Fits? | Step (ms) | Throughput | Peak HBM (rank 0) | Offload/step |
+|----------|-------|-----------|------------|-------------------|--------------|
+| Full AC | ✓ | 15,384 | 17,040 tok/s | 26.7 GB | 0 GB |
+| **Offload all MLP** | **✓** | **13,927** | **18,821 tok/s** | 103.1 GB | 306 GB |
+
+Offload beats Full AC by **+12.5% throughput at μb=4** and **+10.4% at μb=8**.
+The headline claim the repo is named for — selective CPU offloading is useful
+on modern clusters — is validated on an 8× H200 node at a realistic long-context
+training configuration.
+
+### Why this config matters
+
+Three configs were necessary for the experiment to be meaningful. None of them
+are consumer-GPU regimes:
+
+1. **Long context (seq=32768)**: at shorter sequences, activation memory fits
+   trivially and offloading never pays. Long-context training is where modern
+   H200 clusters actually spend their time.
+2. **Pipeline parallelism (PP=4)**: the 1F1B schedule stashes (PP−1−p)=3
+   microbatches on stage 0. Activation pressure is amplified exactly on the
+   stage that would otherwise OOM under No AC.
+3. **Full-GPU-scale mbs**: with mbs=1 seq=32K, No AC peak is 208 GB per stage
+   — well over the 141 GB H200 HBM. There is no amount of TP/DP within 4
+   GPUs that rescues this without either recomputation or offload.
+
+### Simulator validation
+
+| Strategy | Measured step | Simulator no-bubble | Simulator w/ bubble | Error (no bubble) |
+|----------|---------------|---------------------|---------------------|-------------------|
+| Full AC (μb=8) | 15,384 ms | 15,449 ms | 21,243 ms | **−0.4%** |
+| Offload all MLP (μb=8) | 13,927 ms | 11,980 ms | 16,473 ms | +16.3% |
+
+The simulator's compute model is essentially exact for Full AC at seq=32K
+(matches measured to 0.4% on the no-bubble projection). For Offload all MLP,
+measured is 16% slower than the no-bubble prediction — the simulator's
+per-tensor independent stall model undercounts bus contention. Under 1F1B,
+three microbatches' worth of MLP activations (≈ 66 GB per stage) queue
+through one PCIe lane during the warmup phase, and some transfers fail to
+overlap with compute despite the dedicated stream.
+
+The right model for this regime is `simulator/offload_model.py::schedule_offloads`,
+which does account for half-duplex bus serialization — but `simulate()` does
+not invoke it. Wiring `schedule_offloads` into the pipeline-aware path is the
+natural next improvement to the cost model.
+
+### What's next
+
+- Adapt `simulator/environment.py` to call `schedule_offloads` when a pipeline
+  stage accumulates multiple OFFLOAD_CPU decisions across microbatches.
+- Push seq_len higher (seq=65536, seq=131072) to see whether offload continues
+  to beat Full AC as activation/compute ratio shifts.
+- Combine offload with heterogeneous per-stage strategies (pipeline-aware
+  offload): offload-all-mlp on stage 0 where pressure is worst, lighter
+  strategies on later stages.
+
+## Finding: Selective CPU offloading — memory model is exact; overlap depends on stream discipline
+
+### What we measured (2026-04-23)
+
+We validated `simulator/offload_model.py`'s peak-HBM and stall-time predictions
+against real H200 runs. Setup: Llama-2-7B decoder, bfloat16, SDPA attention,
+offloading the `mlp_linear2_input` tensor on every one of the 32 decoder layers
+via `torch.autograd.graph.saved_tensors_hooks` applied only around `down_proj`.
+Hooks filter out parameter-like tensors (leaves with `requires_grad` *and* views
+whose `_base` is such a leaf — this is required to skip `W.T` saved by
+`F.linear`, which otherwise triples the PCIe traffic).
+
+| seq | HBM saved (measured / simulator) | Overhead (default stream) | Overhead (dedicated stream) |
+|-----|----------------------------------|---------------------------|------------------------------|
+| 2048 | 1.344 GB / 1.344 GB (+0.0%) | +49.7 ms (+28.6%) | +2.6 ms (+1.5%) |
+| 4096 | 2.688 GB / 2.688 GB (+0.0%) | +88.6 ms (+24.9%) | +1.5 ms (+0.4%) |
+
+Outputs are bit-identical between the baseline and each offload mode
+(rel_err = 0 in bf16), confirming the pack/unpack round-trip is lossless.
+
+### What the simulator gets right
+
+The formula `saved = size(linear2_input) × num_layers` in `memory_model.py` and
+`environment.py`'s OFFLOAD_CPU branch predicts the retained post-forward
+activation delta to the byte — no surprises, and the prediction scales
+correctly with seq_len.
+
+### What the simulator does NOT model
+
+`simulate()` assumes transfers overlap with compute as long as
+`liveness_gap > round_trip`, and reports zero stall for this config. The
+default-stream run shows ~28% step-time overhead — because the naive
+`cpu.copy_(tensor, non_blocking=True)` DMA still serializes with subsequent
+compute on the same CUDA stream. The "transfers are free" assumption requires
+a dedicated CUDA stream with explicit stream-event synchronization, which is
+what the `dedicated` mode in `offload/hooks.py::CPUOffloadHook` installs.
+
+With the dedicated stream, overhead collapses to the noise floor (≤1.5%), and
+the simulator's "full overlap" prediction holds. Without it, a naive offload
+implementation costs 25-30% throughput — which the simulator currently does
+not reflect. Either the cost model should gain a "sync mode" input, or
+implementations using `saved_tensors_hooks` should document that a dedicated
+stream is non-optional.

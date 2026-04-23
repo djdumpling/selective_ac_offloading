@@ -510,6 +510,46 @@ def _build_korthikanti_selective_decisions(
     return decisions
 
 
+def _build_offload_linear2_decisions(
+    tensors: list[TensorInfo],
+) -> dict[str, TensorDecision]:
+    """Offload just `mlp_linear2_input` (saved by down_proj's backward).
+
+    Keeps every other activation on-GPU. Smallest PCIe footprint that still
+    frees the biggest single MLP tensor per layer.
+    """
+    decisions = {}
+    for t in tensors:
+        if t.name == "mlp_linear2_input":
+            decisions[t.name] = TensorDecision(action=TensorAction.OFFLOAD_CPU)
+        else:
+            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+    return decisions
+
+
+def _build_offload_all_mlp_decisions(
+    tensors: list[TensorInfo],
+) -> dict[str, TensorDecision]:
+    """Offload every MLP activation that's worth more than a few MB: gate_output,
+    up_output, silu_output (SwiGLU) or gelu_output (GeLU), and linear2_input.
+
+    Attention tensors stay on-GPU — they're already small when FA is active."""
+    offload_names = {
+        "mlp_gate_output",
+        "mlp_up_output",
+        "mlp_silu_output",
+        "mlp_gelu_output",
+        "mlp_linear2_input",
+    }
+    decisions = {}
+    for t in tensors:
+        if t.name in offload_names:
+            decisions[t.name] = TensorDecision(action=TensorAction.OFFLOAD_CPU)
+        else:
+            decisions[t.name] = TensorDecision(action=TensorAction.KEEP)
+    return decisions
+
+
 def _build_full_ac_decisions(
     tensors: list[TensorInfo],
     cfg: ModelConfig,
@@ -540,6 +580,8 @@ def _build_full_ac_decisions(
 # Pipeline-aware AC tries these in order and picks the first that fits.
 STRATEGY_LEVELS = [
     ("No AC", _build_no_ac_decisions),
+    ("Offload linear2", _build_offload_linear2_decisions),
+    ("Offload all MLP", _build_offload_all_mlp_decisions),
     ("FA-Selective", _build_fa_selective_decisions),
     ("Korthikanti Selective", _build_korthikanti_selective_decisions),
     ("Full AC", _build_full_ac_decisions),
@@ -581,7 +623,10 @@ def _stash_count_1f1b(stage_idx: int, pp_size: int) -> int:
 
 
 def _build_decisions(build_fn, tensors, cfg, par):
-    """Call a strategy builder, passing through any required config arguments."""
+    """Call a strategy builder, passing through any required config arguments.
+
+    Offload builders (`_build_offload_*`) take only `tensors` — same arity
+    as `_build_no_ac_decisions`, so they fall through to the default branch."""
     if build_fn == _build_fa_selective_decisions:
         return build_fn(tensors, cfg)
     if build_fn == _build_korthikanti_selective_decisions:
