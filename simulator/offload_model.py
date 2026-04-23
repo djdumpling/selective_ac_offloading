@@ -262,9 +262,12 @@ def schedule_offloads(
       no such slot exists, the recv is pushed past the deadline,
       producing stall = recv_end - deadline.
 
-    Tensors are processed in decreasing-deadline order (agreeable
-    deadlines), so the tensor with the most slack is placed first and
-    later tensors with tighter deadlines pack in around it.
+    Tensors are processed in EDF (earliest-deadline-first) order. With
+    zero release times for all sends, EDF with ALAP recv placement is
+    optimal for the agreeable-deadlines job-scheduling problem. Processing
+    longest-deadline-first (the previous order) over-committed the bus to
+    the loose tensor and starved tighter ones — e.g., at gaps [t, 3t]
+    longest-first predicts 3t stall while EDF predicts 2t.
 
     In `sync_mode="serial"`, the bus scheduler is bypassed entirely —
     each tensor incurs stall = round_trip because DMAs serialize with
@@ -292,7 +295,9 @@ def schedule_offloads(
             ))
         return out
 
-    sorted_tensors = sorted(tensors, key=lambda x: x[1], reverse=True)
+    # EDF: earliest-deadline-first. Tightest deadlines take priority on the bus;
+    # looser deadlines pack in around them.
+    sorted_tensors = sorted(tensors, key=lambda x: x[1])
     busy: list[tuple[float, float]] = []  # sorted by start, non-overlapping
     results = []
     eff_bw = effective_pcie_bandwidth(gpu, par)

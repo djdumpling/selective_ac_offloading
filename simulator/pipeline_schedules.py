@@ -144,15 +144,21 @@ def _bubble_1f1b_interleaved(pp: int, num_microbatches: int, num_chunks: int = 2
 
 
 def _bubble_gpipe(pp: int, num_microbatches: int) -> float:
-    """GPipe bubble: (PP-1) / (M + PP - 1).
+    """GPipe bubble: (PP-1) / M — identical to 1F1B.
 
-    Forward of M microbatches takes M + (PP-1) time (last mb doesn't finish
-    until (M-1) + PP steps), and same for backward. Bubble fraction is thus
-    (PP-1) / (M + PP - 1) per direction.
+    Total pipeline wall time for GPipe is (M + PP - 1) × (fwd + bwd): all M
+    microbatches flow through PP stages in forward (takes M + PP - 1 step-times)
+    and again in backward. 1F1B has the same total time — it pipelines fwd and
+    bwd but doesn't remove the warmup/cooldown bubble.
+
+    Since `bottleneck_step_latency_s` in the simulator already bundles
+    fwd + bwd per microbatch, and `overall = bottleneck × (1 + bubble_fraction)`,
+    bubble_fraction = (PP - 1) / M for both schedules. What distinguishes GPipe
+    from 1F1B is memory, not throughput: GPipe stashes all M microbatches' activations.
     """
     if num_microbatches == 0:
         return 1.0
-    return (pp - 1) / (num_microbatches + pp - 1)
+    return (pp - 1) / num_microbatches
 
 
 def _bubble_zero() -> float:

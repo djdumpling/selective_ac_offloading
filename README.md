@@ -106,9 +106,10 @@ The first argument is `pp_size` (also `--nproc_per_node`); the second is one of
 Rank 0 prints a measured-vs-predicted comparison at the end of each run.
 
 Additional flags:
-- `--schedule {1f1b, gpipe, interleaved-1f1b}` (default `1f1b`). GPipe is the
-  worst-memory / smallest-bubble-at-low-M schedule; interleaved cuts the bubble
-  by `1/num_chunks` while keeping the same per-stage memory as 1F1B.
+- `--schedule {1f1b, gpipe, interleaved-1f1b}` (default `1f1b`). GPipe stashes
+  all M microbatches' activations (worst-case memory) but has the same bubble
+  as 1F1B; interleaved cuts the bubble by `1/num_chunks` while keeping the same
+  per-stage memory as 1F1B.
 - `--num-chunks N` (default 2, interleaved only). Virtual stages per rank.
 - `--model {llama7b, llama13b, qwen3_8b}`. Qwen3-8B exercises the GQA + QK-norm
   paths in the memory model under pipeline parallelism.

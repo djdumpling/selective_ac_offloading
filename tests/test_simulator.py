@@ -387,6 +387,29 @@ class TestOffloadModel:
         assert scheduled[0].send_time_s == pytest.approx(independent.send_time_s)
         assert scheduled[0].recv_time_s == pytest.approx(independent.recv_time_s)
 
+    def test_schedule_offloads_uses_edf_not_longest_first(self):
+        """Regression test. Two equal-size tensors with gaps [t, 3t]:
+        longest-first order over-commits bus to the loose tensor and forces
+        3t stall on the tight one. EDF (shortest-deadline-first) produces
+        the optimal 2t stall. At A100 + 100 MB: longest-first = 9.16 ms,
+        EDF = 6.10 ms."""
+        size = 100 * 1024 ** 2
+        t = transfer_time(size, A100_80GB)
+        # Two tensors, gaps t and 3t. EDF → total stall = 2 × (round_trip - t) = 2t.
+        tensors = [
+            (TensorInfo("tight", "test", size, 0.0, []), t),
+            (TensorInfo("loose", "test", size, 0.0, []), 3 * t),
+        ]
+        results = schedule_offloads(tensors, A100_80GB, ParallelismConfig())
+        total_stall = sum(r.stall_time_s for r in results)
+        # Optimal: tight produces t stall (recv ends at 2t, deadline t → t over),
+        # loose produces t stall (recv ends at 4t, deadline 3t → t over).
+        expected_optimal = 2 * t
+        assert total_stall == pytest.approx(expected_optimal, rel=1e-9), (
+            f"EDF order must match optimal {expected_optimal*1000:.3f} ms; "
+            f"got {total_stall*1000:.3f} ms (likely sort reversed)"
+        )
+
 
 class TestOffloadSyncMode:
     """sync_mode='serial' models default-stream behavior where DMAs serialize
@@ -1078,23 +1101,20 @@ class TestGPipeSchedule:
         f1b = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par, 8)
         assert max(gpipe.stash_counts) - max(f1b.stash_counts) == 8 - 4
 
-    def test_gpipe_bubble_formula(self):
-        """GPipe bubble = (PP-1) / (M + PP - 1). At PP=4 M=8: 3/11 ≈ 27.3%."""
+    def test_gpipe_bubble_equals_1f1b(self):
+        """GPipe and 1F1B have identical total pipeline time per step —
+        both add (PP-1) warmup + (PP-1) cooldown stage-times around M useful
+        microbatches. The simulator's bubble_fraction is defined as "extra
+        over ideal per-microbatch," so both return (PP-1)/M. The schedules
+        differ in memory footprint, not throughput."""
         from simulator.pipeline_schedules import get_schedule_profile
         cfg = llama_7b(seq_len=4096, micro_batch_size=1)
         par = ParallelismConfig(pp_size=4)
-        p = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, 8)
-        assert abs(p.bubble_fraction - 3 / 11) < 1e-9
-
-    def test_gpipe_bubble_smaller_than_1f1b_at_small_m(self):
-        """At M=PP, 1F1B bubble = (PP-1)/PP while GPipe bubble = (PP-1)/(2PP-1).
-        GPipe is smaller when M is close to PP (fewer microbatches in flight)."""
-        from simulator.pipeline_schedules import get_schedule_profile
-        cfg = llama_7b(seq_len=4096, micro_batch_size=1)
-        par = ParallelismConfig(pp_size=4)
-        g = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, 4)
-        f = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par, 4)
-        assert g.bubble_fraction < f.bubble_fraction
+        for M in (4, 8, 16, 32):
+            g = get_schedule_profile(PipelineSchedule.GPIPE, cfg, par, M)
+            f = get_schedule_profile(PipelineSchedule.ONE_F_ONE_B, cfg, par, M)
+            assert g.bubble_fraction == pytest.approx(f.bubble_fraction)
+            assert g.bubble_fraction == pytest.approx(3 / M)  # (PP-1)/M with PP=4
 
     def test_pipeline_aware_on_gpipe_picks_more_aggressive(self):
         """Because GPipe stashes M-1 per stage vs 1F1B's PP-1-p, aware-AC under
